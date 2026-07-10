@@ -1,6 +1,6 @@
 //! GPU-resident text decoder for Qwen3-ASR.
 //!
-//! All operational tensors live in GPU memory as `GpuTensor` (CudaSlice<f16>).
+//! All operational tensors live in GPU memory as `GpuTensor` (CudaSlice<bf16>).
 //! cuBLAS handles matmul; hand-written CUDA kernels handle every element-wise
 //! op (RMSNorm, SiLU·up, softmax, rotary, repeat-KV, embed, argmax, etc.).
 //! There are no CPU↔GPU round-trips in the steady-state decode loop —
@@ -14,7 +14,7 @@ use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PinnedHostSlice, PushKernelArg,
 };
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
-use half::f16;
+use half::bf16;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -24,16 +24,16 @@ use crate::raw_tensor::RawTensor;
 const KERNEL_SRC: &str = include_str!("kernels/kernels.cu");
 
 // ═══════════════════════════════════════════════════════════════════════
-//  GpuTensor — owned f16 tensor on the GPU
+//  GpuTensor — owned bf16 tensor on the GPU
 // ═══════════════════════════════════════════════════════════════════════
 
 pub(crate) struct GpuTensor {
-    pub(crate) data: CudaSlice<f16>,
+    pub(crate) data: CudaSlice<bf16>,
     shape: Vec<usize>,
 }
 
 impl GpuTensor {
-    pub fn new(data: CudaSlice<f16>, shape: Vec<usize>) -> Self {
+    pub fn new(data: CudaSlice<bf16>, shape: Vec<usize>) -> Self {
         let expected: usize = shape.iter().product();
         assert_eq!(data.len(), expected, "GpuTensor data len mismatch");
         Self { data, shape }
@@ -53,12 +53,12 @@ impl GpuTensor {
 
 #[derive(Clone)]
 pub(crate) struct CpuTensor {
-    pub data: Vec<f16>,
+    pub data: Vec<bf16>,
     pub shape: Vec<usize>,
 }
 
 impl CpuTensor {
-    pub fn new(data: Vec<f16>, shape: Vec<usize>) -> Self {
+    pub fn new(data: Vec<bf16>, shape: Vec<usize>) -> Self {
         let expected: usize = shape.iter().product();
         assert_eq!(data.len(), expected, "CpuTensor len mismatch");
         Self { data, shape }
@@ -193,26 +193,26 @@ impl CudaState {
         Ok(Self { ctx: ctx.clone(), stream, blas, k })
     }
 
-    pub fn upload_f16(&self, data: &[f16]) -> Result<CudaSlice<f16>> {
+    pub fn upload_f16(&self, data: &[bf16]) -> Result<CudaSlice<bf16>> {
         Ok(self.stream.clone_htod(data)?)
     }
     pub fn upload_i64(&self, data: &[i64]) -> Result<CudaSlice<i64>> {
         Ok(self.stream.clone_htod(data)?)
     }
-    pub fn alloc_zeros_f16(&self, n: usize) -> Result<CudaSlice<f16>> {
-        Ok(self.stream.alloc_zeros::<f16>(n)?)
+    pub fn alloc_zeros_f16(&self, n: usize) -> Result<CudaSlice<bf16>> {
+        Ok(self.stream.alloc_zeros::<bf16>(n)?)
     }
-    /// Allocate uninitialized f16 — caller MUST ensure every byte is written before read.
+    /// Allocate uninitialized bf16 — caller MUST ensure every byte is written before read.
     /// Saves one memset_d8_async vs `alloc_zeros_f16` for cuBLAS/kernel outputs that are
     /// fully overwritten (beta=0 GEMM, fused attention writing all of `out`, etc.).
-    pub fn alloc_uninit_f16(&self, n: usize) -> Result<CudaSlice<f16>> {
-        Ok(unsafe { self.stream.alloc::<f16>(n)? })
+    pub fn alloc_uninit_f16(&self, n: usize) -> Result<CudaSlice<bf16>> {
+        Ok(unsafe { self.stream.alloc::<bf16>(n)? })
     }
     /// Allocate uninitialized i32 — same semantics as `alloc_uninit_f16`.
     pub fn alloc_uninit_i32(&self, n: usize) -> Result<CudaSlice<i32>> {
         Ok(unsafe { self.stream.alloc::<i32>(n)? })
     }
-    pub fn download_f16(&self, slice: &CudaSlice<f16>) -> Result<Vec<f16>> {
+    pub fn download_f16(&self, slice: &CudaSlice<bf16>) -> Result<Vec<bf16>> {
         Ok(self.stream.clone_dtoh(slice)?)
     }
     pub fn download_i32(&self, slice: &CudaSlice<i32>) -> Result<Vec<i32>> {
@@ -257,9 +257,9 @@ impl CudaState {
                     transa: sys::cublasOperation_t::CUBLAS_OP_T,
                     transb: sys::cublasOperation_t::CUBLAS_OP_N,
                     m: n as i32, n: m as i32, k: k as i32,
-                    alpha: f16::from_f32(1.0),
+                    alpha: bf16::from_f32(1.0),
                     lda: k as i32, ldb: k as i32,
-                    beta: f16::from_f32(0.0), ldc: n as i32,
+                    beta: bf16::from_f32(0.0), ldc: n as i32,
                 },
                 &w.data, &x.data, &mut y,
             )?;
@@ -284,9 +284,9 @@ impl CudaState {
                     transa: sys::cublasOperation_t::CUBLAS_OP_T,
                     transb: sys::cublasOperation_t::CUBLAS_OP_N,
                     m: n as i32, n: m as i32, k: k as i32,
-                    alpha: f16::from_f32(1.0),
+                    alpha: bf16::from_f32(1.0),
                     lda: k as i32, ldb: k as i32,
-                    beta: f16::from_f32(1.0), ldc: n as i32,
+                    beta: bf16::from_f32(1.0), ldc: n as i32,
                 },
                 &w.data, &x.data, &mut y.data,
             )?;
@@ -307,9 +307,9 @@ impl CudaState {
                         transa: sys::cublasOperation_t::CUBLAS_OP_T,
                         transb: sys::cublasOperation_t::CUBLAS_OP_N,
                         m: n as i32, n: m as i32, k: d as i32,
-                        alpha: f16::from_f32(1.0),
+                        alpha: bf16::from_f32(1.0),
                         lda: d as i32, ldb: d as i32,
-                        beta: f16::from_f32(0.0), ldc: n as i32,
+                        beta: bf16::from_f32(0.0), ldc: n as i32,
                     },
                     batch_size: batch,
                     stride_a: (n * d) as i64,
@@ -336,9 +336,9 @@ impl CudaState {
                         transa: sys::cublasOperation_t::CUBLAS_OP_N,
                         transb: sys::cublasOperation_t::CUBLAS_OP_N,
                         m: d as i32, n: m as i32, k: n as i32,
-                        alpha: f16::from_f32(1.0),
+                        alpha: bf16::from_f32(1.0),
                         lda: d as i32, ldb: n as i32,
-                        beta: f16::from_f32(0.0), ldc: d as i32,
+                        beta: bf16::from_f32(0.0), ldc: d as i32,
                     },
                     batch_size: batch,
                     stride_a: (n * d) as i64,
@@ -366,7 +366,7 @@ fn block_for_reduction(last: usize) -> u32 {
 
 #[allow(dead_code)]
 impl CudaState {
-    pub fn rms_norm(&self, x: &GpuTensor, w: &CudaSlice<f16>, eps: f32) -> Result<GpuTensor> {
+    pub fn rms_norm(&self, x: &GpuTensor, w: &CudaSlice<bf16>, eps: f32) -> Result<GpuTensor> {
         let nd = x.shape().len();
         let last = x.shape()[nd - 1];
         let outer: usize = x.shape()[..nd - 1].iter().product();
@@ -409,7 +409,7 @@ impl CudaState {
 
     /// Fused: residual += add_in (in-place), then out = rms_norm(residual, w).
     /// Saves one kernel launch vs separate `add` + `rms_norm`.
-    pub fn add_residual_rms_norm(&self, residual: &mut GpuTensor, add_in: &GpuTensor, w: &CudaSlice<f16>, eps: f32) -> Result<GpuTensor> {
+    pub fn add_residual_rms_norm(&self, residual: &mut GpuTensor, add_in: &GpuTensor, w: &CudaSlice<bf16>, eps: f32) -> Result<GpuTensor> {
         let nd = residual.shape().len();
         let last = residual.shape()[nd - 1];
         let outer: usize = residual.shape()[..nd - 1].iter().product();
@@ -472,7 +472,7 @@ impl CudaState {
 
     /// Q/K rotary embedding. x [b, h, s, d], cos/sin [total_s, d] (full table).
     /// pos_offset is added to each `is` to index into cos/sin.
-    pub fn rotary_emb(&self, x: &GpuTensor, cos: &CudaSlice<f16>, sin: &CudaSlice<f16>, pos_offset: usize) -> Result<GpuTensor> {
+    pub fn rotary_emb(&self, x: &GpuTensor, cos: &CudaSlice<bf16>, sin: &CudaSlice<bf16>, pos_offset: usize) -> Result<GpuTensor> {
         let s = x.shape();
         assert_eq!(s.len(), 4);
         let n = x.numel();
@@ -489,8 +489,8 @@ impl CudaState {
 
     /// Fused per-head RMSNorm + rotary on Q or K. x [b, h, s, d].
     /// cos/sin: [total_s, d] (full table). pos_offset is added to each `is`.
-    pub fn rms_norm_rotary(&self, x: &GpuTensor, w: &CudaSlice<f16>,
-                           cos: &CudaSlice<f16>, sin: &CudaSlice<f16>,
+    pub fn rms_norm_rotary(&self, x: &GpuTensor, w: &CudaSlice<bf16>,
+                           cos: &CudaSlice<bf16>, sin: &CudaSlice<bf16>,
                            pos_offset: usize, eps: f32) -> Result<GpuTensor>
     {
         let s = x.shape();
@@ -514,7 +514,7 @@ impl CudaState {
     }
 
     /// Repeat-KV from a sparse KV cache, producing a dense [b, nqh, cur_len, d] view.
-    pub fn repeat_kv_from_cache(&self, cache: &CudaSlice<f16>,
+    pub fn repeat_kv_from_cache(&self, cache: &CudaSlice<bf16>,
         b: usize, nkvh: usize, max_seq: usize, d: usize, n_rep: usize, cur_len: usize,
     ) -> Result<GpuTensor> {
         let nqh = nkvh * n_rep;
@@ -573,7 +573,7 @@ impl CudaState {
 
     /// Argmax on a flat buffer — no GpuTensor wrapper, no D2D clone.
     /// CUDA Graph–safe.
-    pub fn argmax_into_flat(&self, x: &CudaSlice<f16>, n: usize, token_buf: &mut CudaSlice<i32>, slot: usize) -> Result<()> {
+    pub fn argmax_into_flat(&self, x: &CudaSlice<bf16>, n: usize, token_buf: &mut CudaSlice<i32>, slot: usize) -> Result<()> {
         let cfg = LaunchConfig {
             grid_dim: (1, 1, 1),
             block_dim: (1024, 1, 1),
@@ -619,8 +619,8 @@ impl CudaState {
 
     /// Fused: extract Q from fused QKV, apply RMSNorm + rotary in one launch.
     /// qkv: [b, s, q_dim + 2*kv_dim].  Returns Q: [b, nqh, s, d].
-    pub fn qkv_extract_q_norm_rotary(&self, qkv: &GpuTensor, qn_w: &CudaSlice<f16>,
-        cos: &CudaSlice<f16>, sin: &CudaSlice<f16>,
+    pub fn qkv_extract_q_norm_rotary(&self, qkv: &GpuTensor, qn_w: &CudaSlice<bf16>,
+        cos: &CudaSlice<bf16>, sin: &CudaSlice<bf16>,
         nqh: usize, d: usize, pos_offset: usize, eps: f32,
     ) -> Result<GpuTensor> {
         let s = qkv.shape();
@@ -646,9 +646,9 @@ impl CudaState {
     /// Fused: extract K (with RMSNorm+rotary) and V (raw) from fused QKV, write both into KV cache.
     /// Replaces qkv_split×2 + rms_norm_rotary + kv_cache_write_pair (4 launches → 1).
     pub fn qkv_extract_kv_norm_rotary_cache(&self,
-        k_cache: &mut CudaSlice<f16>, v_cache: &mut CudaSlice<f16>,
-        qkv: &GpuTensor, kn_w: &CudaSlice<f16>,
-        cos: &CudaSlice<f16>, sin: &CudaSlice<f16>,
+        k_cache: &mut CudaSlice<bf16>, v_cache: &mut CudaSlice<bf16>,
+        qkv: &GpuTensor, kn_w: &CudaSlice<bf16>,
+        cos: &CudaSlice<bf16>, sin: &CudaSlice<bf16>,
         nkvh: usize, d: usize, q_dim: usize, kv_dim: usize,
         max_seq: usize, start: usize, pos_offset: usize, eps: f32,
     ) -> Result<()> {
@@ -679,9 +679,9 @@ impl CudaState {
     /// writes Q to a fresh output and K/V into their respective caches.
     /// Replaces qkv_extract_q_norm_rotary + qkv_extract_kv_norm_rotary_cache (2 launches → 1).
     pub fn qkv_extract_qkv_norm_rotary_cache(&self,
-        k_cache: &mut CudaSlice<f16>, v_cache: &mut CudaSlice<f16>,
-        qkv: &GpuTensor, qn_w: &CudaSlice<f16>, kn_w: &CudaSlice<f16>,
-        cos: &CudaSlice<f16>, sin: &CudaSlice<f16>,
+        k_cache: &mut CudaSlice<bf16>, v_cache: &mut CudaSlice<bf16>,
+        qkv: &GpuTensor, qn_w: &CudaSlice<bf16>, kn_w: &CudaSlice<bf16>,
+        cos: &CudaSlice<bf16>, sin: &CudaSlice<bf16>,
         nqh: usize, nkvh: usize, d: usize, q_dim: usize, kv_dim: usize,
         max_seq: usize, start: usize, pos_offset: usize, eps: f32,
     ) -> Result<GpuTensor> {
@@ -710,7 +710,7 @@ impl CudaState {
     }
 
     /// Write a [b, nkvh, s_new, d] tensor into a [b, nkvh, max_seq, d] cache at offset `start`.
-    pub fn kv_cache_write(&self, cache: &mut CudaSlice<f16>, k_new: &GpuTensor,
+    pub fn kv_cache_write(&self, cache: &mut CudaSlice<bf16>, k_new: &GpuTensor,
         b: usize, nkvh: usize, max_seq: usize, d: usize, start: usize,
     ) -> Result<()> {
         let s_new = k_new.shape()[2];
@@ -727,7 +727,7 @@ impl CudaState {
     }
 
     /// Fused: write K and V into their caches in one kernel.
-    pub fn kv_cache_write_pair(&self, k_cache: &mut CudaSlice<f16>, v_cache: &mut CudaSlice<f16>,
+    pub fn kv_cache_write_pair(&self, k_cache: &mut CudaSlice<bf16>, v_cache: &mut CudaSlice<bf16>,
         k_new: &GpuTensor, v_new: &GpuTensor,
         b: usize, nkvh: usize, max_seq: usize, d: usize, start: usize,
     ) -> Result<()> {
@@ -754,7 +754,7 @@ impl CudaState {
         Ok(())
     }
 
-    pub fn layer_norm(&self, x: &GpuTensor, w: &CudaSlice<f16>, bias: &CudaSlice<f16>, eps: f32) -> Result<GpuTensor> {
+    pub fn layer_norm(&self, x: &GpuTensor, w: &CudaSlice<bf16>, bias: &CudaSlice<bf16>, eps: f32) -> Result<GpuTensor> {
         let nd = x.shape().len();
         let last = x.shape()[nd - 1];
         let outer: usize = x.shape()[..nd - 1].iter().product();
@@ -773,7 +773,7 @@ impl CudaState {
         Ok(GpuTensor::new(out, x.shape().to_vec()))
     }
 
-    pub fn add_bias_inplace(&self, x: &mut GpuTensor, bias: &CudaSlice<f16>) -> Result<()> {
+    pub fn add_bias_inplace(&self, x: &mut GpuTensor, bias: &CudaSlice<bf16>) -> Result<()> {
         let nd = x.shape().len();
         let last = x.shape()[nd - 1];
         let outer: usize = x.shape()[..nd - 1].iter().product();
@@ -806,7 +806,7 @@ impl CudaState {
     }
 
     /// Write a [b, h, len, d] chunk into a pre-allocated [b, h, s, d] buffer at `dst_offset`.
-    pub fn concat_dim2_write(&self, dst: &mut CudaSlice<f16>, src: &GpuTensor,
+    pub fn concat_dim2_write(&self, dst: &mut CudaSlice<bf16>, src: &GpuTensor,
         b: usize, h: usize, s: usize, d: usize, dst_offset: usize,
     ) -> Result<()> {
         let len = src.shape()[2];
@@ -825,8 +825,8 @@ impl CudaState {
     /// 3×3 conv2d with stride=2, padding=1 — via im2col + cuBLAS GEMM + fused bias/GELU.
     /// input: [b, c_in, h, w]; weight: [c_out, c_in, 3, 3]; bias: [c_out].
     /// Returns [b, c_out, h_out, w_out] with GELU applied.
-    pub fn conv2d_3x3_s2p1_gelu(&self, x: &GpuTensor, weight: &CudaSlice<f16>,
-        c_out: usize, c_in: usize, bias: &CudaSlice<f16>,
+    pub fn conv2d_3x3_s2p1_gelu(&self, x: &GpuTensor, weight: &CudaSlice<bf16>,
+        c_out: usize, c_in: usize, bias: &CudaSlice<bf16>,
     ) -> Result<GpuTensor> {
         let s = x.shape();
         assert_eq!(s.len(), 4);
@@ -860,9 +860,9 @@ impl CudaState {
                     transa: sys::cublasOperation_t::CUBLAS_OP_T,  // weight: K-major in row-major = T in col-major
                     transb: sys::cublasOperation_t::CUBLAS_OP_N,
                     m: n as i32, n: m as i32, k: k as i32,
-                    alpha: f16::from_f32(1.0),
+                    alpha: bf16::from_f32(1.0),
                     lda: k as i32, ldb: k as i32,
-                    beta: f16::from_f32(0.0), ldc: n as i32,
+                    beta: bf16::from_f32(0.0), ldc: n as i32,
                 },
                 weight, &col, &mut gemm_out,
             )?;
@@ -884,7 +884,7 @@ impl CudaState {
     /// Conv1d (kernel=3, padding=1, configurable stride) + GELU for the Whisper stem.
     /// x: [b, in_ch, in_t], weight: [out_ch, in_ch, 3], bias: [out_ch].
     /// Returns [b, out_ch, out_t] with GELU applied.
-    pub fn conv1d_k3_gelu(&self, x: &GpuTensor, weight: &CudaSlice<f16>, bias: &CudaSlice<f16>,
+    pub fn conv1d_k3_gelu(&self, x: &GpuTensor, weight: &CudaSlice<bf16>, bias: &CudaSlice<bf16>,
                           in_ch: usize, out_ch: usize, stride: usize) -> Result<GpuTensor> {
         let s = x.shape();
         assert_eq!(s.len(), 3);
@@ -930,7 +930,7 @@ impl CudaState {
     }
 
     /// Broadcast positional-embedding add: out[b,t,d] = x[b,t,d] + pe[t,d].
-    pub fn add_pe(&self, x: &GpuTensor, pe: &CudaSlice<f16>, t: usize) -> Result<GpuTensor> {
+    pub fn add_pe(&self, x: &GpuTensor, pe: &CudaSlice<bf16>, t: usize) -> Result<GpuTensor> {
         let s = x.shape();
         assert_eq!(s.len(), 3);
         let (b, t_chk, d) = (s[0], s[1], s[2]);
@@ -952,7 +952,7 @@ impl CudaState {
     /// (4 launches + 2 big allocs) with a single kernel that reads K/V directly from the cache.
     /// Q: [b, nqh, 1, d].  Returns out: [b, nqh, 1, d].
     pub fn fused_gqa_decode(&self, q: &GpuTensor,
-        k_cache: &CudaSlice<f16>, v_cache: &CudaSlice<f16>,
+        k_cache: &CudaSlice<bf16>, v_cache: &CudaSlice<bf16>,
         nkvh: usize, max_seq: usize, cur_len: usize, scale: f32,
     ) -> Result<GpuTensor> {
         let s = q.shape();
@@ -988,7 +988,7 @@ impl CudaState {
     /// independent blocks, then merges with an online-softmax correction kernel.  Use when
     /// cur_len is large enough that the single-block kernel underutilizes the SMs.
     pub fn fused_gqa_decode_split(&self, q: &GpuTensor,
-        k_cache: &CudaSlice<f16>, v_cache: &CudaSlice<f16>,
+        k_cache: &CudaSlice<bf16>, v_cache: &CudaSlice<bf16>,
         nkvh: usize, max_seq: usize, cur_len: usize, scale: f32,
         chunk_size: usize,
     ) -> Result<GpuTensor> {
@@ -1048,7 +1048,7 @@ impl CudaState {
 // ═══════════════════════════════════════════════════════════════════════
 
 pub(crate) struct GpuWeight {
-    pub data: CudaSlice<f16>,
+    pub data: CudaSlice<bf16>,
     pub rows: usize,
     pub cols: usize,
 }
@@ -1059,8 +1059,8 @@ pub(crate) struct GpuWeight {
 
 #[allow(dead_code)]
 pub(crate) struct GpuKvCache {
-    pub k: Vec<CudaSlice<f16>>,   // per layer: [b, nkvh, max_seq, d]
-    pub v: Vec<CudaSlice<f16>>,
+    pub k: Vec<CudaSlice<bf16>>,   // per layer: [b, nkvh, max_seq, d]
+    pub v: Vec<CudaSlice<bf16>>,
     pub cur_len: usize,
     pub max_seq: usize,
     pub b: usize,
@@ -1095,15 +1095,15 @@ pub(crate) fn load_gpu_weight(cuda: &CudaState, weights: &HashMap<String, RawTen
     Ok(GpuWeight { data: dev, rows: shape[0], cols: shape[1] })
 }
 
-pub(crate) fn load_gpu_vec(cuda: &CudaState, weights: &HashMap<String, RawTensor>, name: &str) -> Result<CudaSlice<f16>> {
+pub(crate) fn load_gpu_vec(cuda: &CudaState, weights: &HashMap<String, RawTensor>, name: &str) -> Result<CudaSlice<bf16>> {
     let (data_f16, _shape) = get_weight_f16(weights, name)?;
     cuda.upload_f16(&data_f16)
 }
 
-fn get_weight_f16(weights: &HashMap<String, RawTensor>, name: &str) -> Result<(Vec<f16>, Vec<usize>)> {
+fn get_weight_f16(weights: &HashMap<String, RawTensor>, name: &str) -> Result<(Vec<bf16>, Vec<usize>)> {
     let td = weights.get(name).ok_or_else(|| anyhow::anyhow!("weight not found: {}", name))?;
-    let (data_f16, shape) = td.as_f16()?;
-    Ok((data_f16, shape))
+    let (data_bf16, shape) = td.as_bf16()?;
+    Ok((data_bf16, shape))
 }
 
 fn load_fused_qkv_weight(
@@ -1141,13 +1141,13 @@ fn load_fused_gate_up_weight(
 #[allow(dead_code)]
 pub(crate) struct DecodeScratch {
     // Per-layer temporaries (reused across layers since they run sequentially)
-    pub norm1: CudaSlice<f16>,           // [hidden_size]
-    pub qkv: CudaSlice<f16>,            // [fused_qkv_dim] = nqh*hd + 2*nkvh*hd = 4096
-    pub q_out: CudaSlice<f16>,          // [nqh * hd] = 2048
-    pub attn_out: CudaSlice<f16>,       // [nqh * hd] = 2048
-    pub norm2: CudaSlice<f16>,          // [hidden_size]
-    pub gate_up: CudaSlice<f16>,        // [2 * intermediate_size] = 6144
-    pub activated: CudaSlice<f16>,      // [intermediate_size] = 3072
+    pub norm1: CudaSlice<bf16>,           // [hidden_size]
+    pub qkv: CudaSlice<bf16>,            // [fused_qkv_dim] = nqh*hd + 2*nkvh*hd = 4096
+    pub q_out: CudaSlice<bf16>,          // [nqh * hd] = 2048
+    pub attn_out: CudaSlice<bf16>,       // [nqh * hd] = 2048
+    pub norm2: CudaSlice<bf16>,          // [hidden_size]
+    pub gate_up: CudaSlice<bf16>,        // [2 * intermediate_size] = 6144
+    pub activated: CudaSlice<bf16>,      // [intermediate_size] = 3072
 
     // Split attention partials — pre-sized for max_chunks
     pub split_part_out: CudaSlice<f32>, // [nqh * max_chunks * hd]
@@ -1155,9 +1155,9 @@ pub(crate) struct DecodeScratch {
     pub split_part_sum: CudaSlice<f32>, // [nqh * max_chunks]
 
     // Decoder-level temporaries
-    pub embed_out: CudaSlice<f16>,      // [hidden_size]
-    pub final_norm: CudaSlice<f16>,     // [hidden_size]
-    pub logits: CudaSlice<f16>,         // [vocab_size]
+    pub embed_out: CudaSlice<bf16>,      // [hidden_size]
+    pub final_norm: CudaSlice<bf16>,     // [hidden_size]
+    pub logits: CudaSlice<bf16>,         // [vocab_size]
 
     // Pinned host buffer for async D2H of the decoded token.
     pub pinned_token: PinnedHostSlice<i32>,
@@ -1211,7 +1211,7 @@ impl DecodeScratch {
 impl CudaState {
     /// rms_norm on a flat buffer — no GpuTensor wrapper, no D2D clone.
     /// CUDA Graph–safe (no cuMemcpyDtD).
-    pub fn rms_norm_into_flat(&self, x: &CudaSlice<f16>, last: usize, outer: usize, w: &CudaSlice<f16>, eps: f32, out: &mut CudaSlice<f16>) -> Result<()> {
+    pub fn rms_norm_into_flat(&self, x: &CudaSlice<bf16>, last: usize, outer: usize, w: &CudaSlice<bf16>, eps: f32, out: &mut CudaSlice<bf16>) -> Result<()> {
         let bs = block_for_reduction(last);
         let cfg = LaunchConfig { grid_dim: (outer as u32, 1, 1), block_dim: (bs, 1, 1), shared_mem_bytes: bs * 4 };
         let last_i = last as i32; let outer_i = outer as i32;
@@ -1223,7 +1223,7 @@ impl CudaState {
 
     /// linear_gpu on a flat buffer — no GpuTensor wrapper, no D2D clone.
     /// CUDA Graph–safe (no cuMemcpyDtD).
-    pub fn linear_gpu_into_flat(&self, x: &CudaSlice<f16>, m: usize, k: usize, w: &GpuWeight, out: &mut CudaSlice<f16>) -> Result<()> {
+    pub fn linear_gpu_into_flat(&self, x: &CudaSlice<bf16>, m: usize, k: usize, w: &GpuWeight, out: &mut CudaSlice<bf16>) -> Result<()> {
         let n = w.rows;
         assert_eq!(k, w.cols);
         unsafe {
@@ -1232,9 +1232,9 @@ impl CudaState {
                     transa: sys::cublasOperation_t::CUBLAS_OP_T,
                     transb: sys::cublasOperation_t::CUBLAS_OP_N,
                     m: n as i32, n: m as i32, k: k as i32,
-                    alpha: f16::from_f32(1.0),
+                    alpha: bf16::from_f32(1.0),
                     lda: k as i32, ldb: k as i32,
-                    beta: f16::from_f32(0.0), ldc: n as i32,
+                    beta: bf16::from_f32(0.0), ldc: n as i32,
                 },
                 &w.data, x, out,
             )?;
@@ -1242,8 +1242,8 @@ impl CudaState {
         Ok(())
     }
 
-    /// silu_mul_split writing into a pre-allocated `out` buffer.  `out` must have `outer * inter` f16 elements.
-    pub fn silu_mul_split_into(&self, gu: &CudaSlice<f16>, outer: usize, two_inter: usize, out: &mut CudaSlice<f16>) -> Result<()> {
+    /// silu_mul_split writing into a pre-allocated `out` buffer.  `out` must have `outer * inter` bf16 elements.
+    pub fn silu_mul_split_into(&self, gu: &CudaSlice<bf16>, outer: usize, two_inter: usize, out: &mut CudaSlice<bf16>) -> Result<()> {
         let inter = two_inter / 2;
         let total = outer * inter;
         let cfg = LaunchConfig::for_num_elems(total as u32);
@@ -1256,12 +1256,12 @@ impl CudaState {
 
     /// qkv_extract writing Q into pre-allocated `q_out` buffer.
     pub fn qkv_extract_into(&self,
-        k_cache: &mut CudaSlice<f16>, v_cache: &mut CudaSlice<f16>,
-        qkv: &CudaSlice<f16>, qn_w: &CudaSlice<f16>, kn_w: &CudaSlice<f16>,
-        cos: &CudaSlice<f16>, sin: &CudaSlice<f16>,
+        k_cache: &mut CudaSlice<bf16>, v_cache: &mut CudaSlice<bf16>,
+        qkv: &CudaSlice<bf16>, qn_w: &CudaSlice<bf16>, kn_w: &CudaSlice<bf16>,
+        cos: &CudaSlice<bf16>, sin: &CudaSlice<bf16>,
         nqh: usize, nkvh: usize, d: usize, q_dim: usize, kv_dim: usize,
         max_seq: usize, start: usize, pos_offset: usize, eps: f32,
-        q_out: &mut CudaSlice<f16>,
+        q_out: &mut CudaSlice<bf16>,
     ) -> Result<()> {
         let b: usize = 1; let sl: usize = 1;
         let total_cols = q_dim + 2 * kv_dim;
@@ -1284,10 +1284,10 @@ impl CudaState {
     /// fused_gqa_decode writing into a pre-allocated `out` buffer (flat, no GpuTensor).
     /// Single-kernel path for short-to-medium context (cur_len ≤ ~1024). Saves 1 launch
     /// vs the split path (p1+p2). Used by decode when cur_len is below the split threshold.
-    pub fn fused_gqa_decode_into(&self, q: &CudaSlice<f16>,
-        k_cache: &CudaSlice<f16>, v_cache: &CudaSlice<f16>,
+    pub fn fused_gqa_decode_into(&self, q: &CudaSlice<bf16>,
+        k_cache: &CudaSlice<bf16>, v_cache: &CudaSlice<bf16>,
         nqh: usize, nkvh: usize, max_seq: usize, cur_len: usize, scale: f32,
-        out: &mut CudaSlice<f16>,
+        out: &mut CudaSlice<bf16>,
     ) -> Result<()> {
         let b: usize = 1;
         let d: usize = out.len() / nqh;  // nqh * d = out.len()
@@ -1314,11 +1314,11 @@ impl CudaState {
 
     /// fused_gqa_decode_split writing into pre-allocated partial + output buffers.
     /// `max_chunks` is the fixed grid y-dimension (upper bound for graph stability).
-    pub fn fused_gqa_decode_split_into(&self, q: &CudaSlice<f16>,
-        k_cache: &CudaSlice<f16>, v_cache: &CudaSlice<f16>,
+    pub fn fused_gqa_decode_split_into(&self, q: &CudaSlice<bf16>,
+        k_cache: &CudaSlice<bf16>, v_cache: &CudaSlice<bf16>,
         nkvh: usize, max_seq: usize, cur_len: usize, scale: f32, chunk_size: usize, max_chunks: usize,
         part_out: &mut CudaSlice<f32>, part_max: &mut CudaSlice<f32>, part_sum: &mut CudaSlice<f32>,
-        out: &mut CudaSlice<f16>,
+        out: &mut CudaSlice<bf16>,
     ) -> Result<()> {
         let n_chunks = (cur_len + chunk_size - 1) / chunk_size;
         let bs: u32 = 256;
@@ -1348,7 +1348,7 @@ impl CudaState {
     }
 
     /// embed_id_from_gpu_slot writing into a pre-allocated `out` buffer.
-    pub fn embed_id_from_gpu_slot_into(&self, table: &GpuWeight, token_buf: &CudaSlice<i32>, slot: usize, out: &mut CudaSlice<f16>) -> Result<()> {
+    pub fn embed_id_from_gpu_slot_into(&self, table: &GpuWeight, token_buf: &CudaSlice<i32>, slot: usize, out: &mut CudaSlice<bf16>) -> Result<()> {
         let d = table.cols;
         let bs = (d as u32).min(1024);
         let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (bs, 1, 1), shared_mem_bytes: 0 };
@@ -1361,7 +1361,7 @@ impl CudaState {
 
     /// linear_gpu_accum on raw CudaSlice (for decode scratch path).
     /// y = y + x @ W^T.  x has shape [1, 1, k], W is [n, k], y is [n].
-    pub fn linear_gpu_accum_slice(&self, y: &mut CudaSlice<f16>, x: &CudaSlice<f16>, w: &GpuWeight) -> Result<()> {
+    pub fn linear_gpu_accum_slice(&self, y: &mut CudaSlice<bf16>, x: &CudaSlice<bf16>, w: &GpuWeight) -> Result<()> {
         let k = w.cols;
         let n = w.rows;
         unsafe {
@@ -1370,9 +1370,9 @@ impl CudaState {
                     transa: sys::cublasOperation_t::CUBLAS_OP_T,
                     transb: sys::cublasOperation_t::CUBLAS_OP_N,
                     m: n as i32, n: 1, k: k as i32,
-                    alpha: f16::from_f32(1.0),
+                    alpha: bf16::from_f32(1.0),
                     lda: k as i32, ldb: k as i32,
-                    beta: f16::from_f32(1.0), ldc: n as i32,
+                    beta: bf16::from_f32(1.0), ldc: n as i32,
                 },
                 &w.data, x, y,
             )?;
@@ -1387,10 +1387,10 @@ impl CudaState {
 
 #[allow(dead_code)]
 struct GpuDecoderLayer {
-    iln_w: CudaSlice<f16>,
-    pln_w: CudaSlice<f16>,
-    qn_w: CudaSlice<f16>,
-    kn_w: CudaSlice<f16>,
+    iln_w: CudaSlice<bf16>,
+    pln_w: CudaSlice<bf16>,
+    qn_w: CudaSlice<bf16>,
+    kn_w: CudaSlice<bf16>,
     qkv_w: GpuWeight,
     o_w: GpuWeight,
     gu_w: GpuWeight,
@@ -1420,7 +1420,7 @@ impl GpuDecoderLayer {
     /// x: [b, s, hs]  (always GPU, consumed — reused as the residual stream so we
     /// don't allocate+memcpy a clone before the O-proj accumulation).
     /// cos/sin: [s, d]  device-resident slice for the positions of this call
-    fn forward(&self, x: GpuTensor, cos: &CudaSlice<f16>, sin: &CudaSlice<f16>,
+    fn forward(&self, x: GpuTensor, cos: &CudaSlice<bf16>, sin: &CudaSlice<bf16>,
                kv: &mut GpuKvCache, layer_idx: usize, kv_start: usize, use_causal: bool,
                cuda: &CudaState) -> Result<GpuTensor>
     {
@@ -1506,7 +1506,7 @@ impl GpuDecoderLayer {
 
     /// Decode-only forward (s=1, b=1).  Zero-alloc path using DecodeScratch.
     /// `h` is the hidden state buffer [hs] (flat), modified in-place.
-    fn forward_decode(&self, h: &mut CudaSlice<f16>, cos: &CudaSlice<f16>, sin: &CudaSlice<f16>,
+    fn forward_decode(&self, h: &mut CudaSlice<bf16>, cos: &CudaSlice<bf16>, sin: &CudaSlice<bf16>,
                       kv: &mut GpuKvCache, layer_idx: usize, kv_start: usize,
                       cuda: &CudaState, scratch: &mut DecodeScratch) -> Result<()>
     {
@@ -1569,7 +1569,7 @@ impl GpuDecoderLayer {
 pub(crate) struct GpuTextDecoder {
     pub embed_table: GpuWeight,        // [vocab, hidden]  (also reused as lm_head)
     layers: Vec<GpuDecoderLayer>,
-    norm_w: CudaSlice<f16>,            // [hidden]
+    norm_w: CudaSlice<bf16>,            // [hidden]
     eps: f32,
     pub config: TextDecoderConfig,
     pub cuda: Arc<CudaState>,
@@ -1600,7 +1600,7 @@ impl GpuTextDecoder {
     /// hs: [1, sl, hidden] (GPU). cos/sin: [sl, head_dim] (GPU).
     /// kv_start: how many positions are already in the cache (0 for prefill).
     /// Returns logits as a GpuTensor of shape [1, out_sl, vocab] (out_sl = 1 if llo).
-    pub fn forward(&self, hs: GpuTensor, cos: &CudaSlice<f16>, sin: &CudaSlice<f16>,
+    pub fn forward(&self, hs: GpuTensor, cos: &CudaSlice<bf16>, sin: &CudaSlice<bf16>,
                    kv: &mut GpuKvCache, kv_start: usize, use_causal: bool, llo: bool) -> Result<GpuTensor>
     {
         let sl = hs.shape()[1];
@@ -1625,8 +1625,8 @@ impl GpuTextDecoder {
     }
 
     /// Zero-alloc decode: runs all layers via scratch buffers, final norm + lm_head,
-    /// writes argmax into `token_buf[slot]`.  The hidden state `h` must be [hs] f16.
-    pub fn forward_decode_scratch(&self, h: &mut CudaSlice<f16>, cos: &CudaSlice<f16>, sin: &CudaSlice<f16>,
+    /// writes argmax into `token_buf[slot]`.  The hidden state `h` must be [hs] bf16.
+    pub fn forward_decode_scratch(&self, h: &mut CudaSlice<bf16>, cos: &CudaSlice<bf16>, sin: &CudaSlice<bf16>,
                                   kv: &mut GpuKvCache, kv_start: usize,
                                   token_buf: &mut CudaSlice<i32>,
                                   scratch: &mut DecodeScratch) -> Result<()>
@@ -1668,14 +1668,14 @@ impl GpuTextDecoder {
 //  Standard RoPE cos/sin precompute (CPU side, then upload to GPU)
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Standard RoPE cos/sin as f16 CpuTensors of shape [seq_len, head_dim],
+/// Standard RoPE cos/sin as bf16 CpuTensors of shape [seq_len, head_dim],
 /// half-mirrored layout (matches rotary_emb_f16 / rms_norm_rotary_f16 kernels).
 pub(crate) fn compute_rope_cos_sin_f16(
     pos: &[i64], head_dim: usize, rope_theta: f64,
 ) -> (CpuTensor, CpuTensor) {
     let (cv, sv) = crate::mrope::compute_rope_cos_sin(pos, head_dim, rope_theta);
     let sl = pos.len();
-    let cos = CpuTensor::new(cv.iter().map(|&v| f16::from_f32(v)).collect(), vec![sl, head_dim]);
-    let sin = CpuTensor::new(sv.iter().map(|&v| f16::from_f32(v)).collect(), vec![sl, head_dim]);
+    let cos = CpuTensor::new(cv.iter().map(|&v| bf16::from_f32(v)).collect(), vec![sl, head_dim]);
+    let sin = CpuTensor::new(sv.iter().map(|&v| bf16::from_f32(v)).collect(), vec![sl, head_dim]);
     (cos, sin)
 }

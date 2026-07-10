@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
-use half::f16;
+use half::bf16;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -17,14 +17,14 @@ use crate::raw_tensor::RawTensor;
 
 pub struct GpuWhisperEncoder {
     cuda: Arc<CudaState>,
-    conv1_w: CudaSlice<f16>,   // [out_ch, in_ch, 3] flat
-    conv1_b: CudaSlice<f16>,
-    conv2_w: CudaSlice<f16>,
-    conv2_b: CudaSlice<f16>,
-    embed_positions: CudaSlice<f16>,
+    conv1_w: CudaSlice<bf16>,   // [out_ch, in_ch, 3] flat
+    conv1_b: CudaSlice<bf16>,
+    conv2_w: CudaSlice<bf16>,
+    conv2_b: CudaSlice<bf16>,
+    embed_positions: CudaSlice<bf16>,
     layers: Vec<GpuWhisperLayerData>,
-    ln_w: CudaSlice<f16>,
-    ln_b: CudaSlice<f16>,
+    ln_w: CudaSlice<bf16>,
+    ln_b: CudaSlice<bf16>,
     d_model: usize,
     n_heads: usize,
     ffn: usize,
@@ -32,14 +32,14 @@ pub struct GpuWhisperEncoder {
 }
 
 struct GpuWhisperLayerData {
-    sln_w: CudaSlice<f16>, sln_b: CudaSlice<f16>,
-    fln_w: CudaSlice<f16>, fln_b: CudaSlice<f16>,
-    q_w: GpuWeight, q_b: CudaSlice<f16>,
-    k_w: GpuWeight, k_b: CudaSlice<f16>,
-    v_w: GpuWeight, v_b: CudaSlice<f16>,
-    o_w: GpuWeight, o_b: CudaSlice<f16>,
-    fc1_w: GpuWeight, fc1_b: CudaSlice<f16>,
-    fc2_w: GpuWeight, fc2_b: CudaSlice<f16>,
+    sln_w: CudaSlice<bf16>, sln_b: CudaSlice<bf16>,
+    fln_w: CudaSlice<bf16>, fln_b: CudaSlice<bf16>,
+    q_w: GpuWeight, q_b: CudaSlice<bf16>,
+    k_w: GpuWeight, k_b: CudaSlice<bf16>,
+    v_w: GpuWeight, v_b: CudaSlice<bf16>,
+    o_w: GpuWeight, o_b: CudaSlice<bf16>,
+    fc1_w: GpuWeight, fc1_b: CudaSlice<bf16>,
+    fc2_w: GpuWeight, fc2_b: CudaSlice<bf16>,
 }
 
 impl GpuWhisperEncoder {
@@ -47,11 +47,11 @@ impl GpuWhisperEncoder {
 
     pub fn load(cuda: Arc<CudaState>, weights: &HashMap<String, RawTensor>, prefix: &str, cfg: &WhisperAudioConfig) -> Result<Self> {
         let g = |name: &str| -> Result<GpuWeight> { crate::cudarc_engine::load_gpu_weight(&cuda, weights, name) };
-        let gv = |name: &str| -> Result<CudaSlice<f16>> { crate::cudarc_engine::load_gpu_vec(&cuda, weights, name) };
+        let gv = |name: &str| -> Result<CudaSlice<bf16>> { crate::cudarc_engine::load_gpu_vec(&cuda, weights, name) };
         let p = |s: &str| format!("{}.{}", prefix, s);
         let mut layers = Vec::with_capacity(cfg.encoder_layers);
         // Load all weights first, then move cuda into the struct.
-        // Conv1d weights are 3-D [out_ch, in_ch, 3] — load as flat f16 vectors
+        // Conv1d weights are 3-D [out_ch, in_ch, 3] — load as flat bf16 vectors
         // (the kernel reads them row-major directly).
         let conv1_w = gv(&p("conv1.weight"))?;
         let conv1_b = gv(&p("conv1.bias"))?;
@@ -63,11 +63,11 @@ impl GpuWhisperEncoder {
         for i in 0..cfg.encoder_layers {
             let lp = format!("{}.layers.{}", prefix, i);
             let g2 = |s: &str| -> Result<GpuWeight> { crate::cudarc_engine::load_gpu_weight(&cuda, weights, &format!("{}.{}", lp, s)) };
-            let gv2 = |s: &str| -> Result<CudaSlice<f16>> { crate::cudarc_engine::load_gpu_vec(&cuda, weights, &format!("{}.{}", lp, s)) };
+            let gv2 = |s: &str| -> Result<CudaSlice<bf16>> { crate::cudarc_engine::load_gpu_vec(&cuda, weights, &format!("{}.{}", lp, s)) };
             // k_proj has bias=False in Whisper; fall back to a zero vector if absent.
             let k_b = match gv2("self_attn.k_proj.bias") {
                 Ok(b) => b,
-                Err(_) => cuda.upload_f16(&vec![f16::from_f32(0.0); cfg.d_model])?,
+                Err(_) => cuda.upload_f16(&vec![bf16::from_f32(0.0); cfg.d_model])?,
             };
             layers.push(GpuWhisperLayerData {
                 sln_w: gv2("self_attn_layer_norm.weight")?,
@@ -108,7 +108,7 @@ impl GpuWhisperEncoder {
     /// mel: [1, num_mel, nb_max_frames] f32 host → uploaded. Returns host [1, T_out*d_model] f32.
     pub fn forward_f32(&self, mel: &[f32], num_mel: usize, nb_frames: usize) -> Result<Vec<f32>> {
         let b = 1usize;
-        let mel_f16: Vec<f16> = mel.iter().map(|&v| f16::from_f32(v)).collect();
+        let mel_f16: Vec<bf16> = mel.iter().map(|&v| bf16::from_f32(v)).collect();
         let mel_gpu = self.cuda.upload_f16(&mel_f16)?;
         let mut x = GpuTensor::new(mel_gpu, vec![b, num_mel, nb_frames]);
         // conv1 (stride 1) + GELU, conv2 (stride 2) + GELU

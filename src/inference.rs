@@ -347,18 +347,18 @@ impl AsrInner {
         use crate::cudarc_engine::{
             compute_rope_cos_sin_f16, CpuTensor as GpuCpuTensor, DecodeScratch, GpuKvCache,
         };
-        use half::f16;
+        use half::bf16;
 
         let cuda = &gpu.cuda;
         let decoder = &gpu.decoder;
         let text_cfg = &self.config.text_config;
         let head_dim = text_cfg.head_dim;
 
-        // Upload hidden_states [1, seq_len, hidden] as f16.
-        let hs_f16: Vec<f16> = hidden_states.data.iter().map(|&v| f16::from_f32(v)).collect();
+        // Upload hidden_states [1, seq_len, hidden] as bf16.
+        let hs_f16: Vec<bf16> = hidden_states.data.iter().map(|&v| bf16::from_f32(v)).collect();
         let hs_gpu = cuda.upload_tensor(&GpuCpuTensor::new(hs_f16, vec![1, seq_len, text_cfg.hidden_size]))?;
 
-        // RoPE cos/sin tables over all positions, uploaded as f16.
+        // RoPE cos/sin tables over all positions, uploaded as bf16.
         let (cos_cpu, sin_cpu) = compute_rope_cos_sin_f16(all_pos, head_dim, text_cfg.rope_theta);
         let cos = cuda.upload_f16(&cos_cpu.data)?;
         let sin = cuda.upload_f16(&sin_cpu.data)?;

@@ -1,12 +1,29 @@
-// GPU element-wise kernels for the Qwen3-ASR text decoder + audio encoder.
-// All arithmetic accumulates in f32 but storage is f16.
-// Targets sm_61+ (no requirement for tensor cores or f16 atomics).
+// GPU element-wise kernels for the MOSS-Transcribe-Diarize decoder + encoder.
+// All arithmetic accumulates in f32 but storage is BF16 (matches the Python
+// original's bfloat16 compute, for node-by-node token-level alignment).
+// Targets sm_61+ (bf16 has no native compute units on sm_61; cuBLAS uses an
+// emulated path, and these kernels convert bf16→f32 for all math).
+//
+// Implementation note: we remap the __half* intrinsics to __nv_bfloat16*
+// equivalents via macros below, so the kernel bodies read identically to the
+// f16 originals while operating on bf16 storage. Vectorized __half2 loads are
+// preserved as __nv_bfloat162 (still a valid 32-bit memory transaction even
+// without bf16 ALU support).
 
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
 #ifndef INFINITY
 #define INFINITY __int_as_float(0x7f800000)
 #endif
+
+// ── BF16 remap macros ────────────────────────────────────────────────
+// Map the f16 intrinsic names used throughout this file to bf16 equivalents.
+#define __half          __nv_bfloat16
+#define __half2         __nv_bfloat162
+#define __half2float    __bfloat162float
+#define __float2half    __float2bfloat16
+#define __halves2half2  __halves2bfloat162
 
 // ─── RMS norm: x [outer, last] * weight[last] → out, with f32 accumulation ──
 // One block per row; block_size threads cooperate over `last`.

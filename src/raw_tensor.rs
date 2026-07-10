@@ -47,7 +47,10 @@ impl RawTensor {
         }
     }
 
-    /// Convert raw bytes to a `Vec<half::f16>`. Supports F32 / F16.
+    /// Convert raw bytes to a `Vec<half::f16>`. Supports F32 / F16 / BF16.
+    ///
+    /// NOTE: BF16→F16 is a **lossy** conversion (different exponent/mantissa split).
+    /// For bit-exact alignment with a BF16 Python model, use `to_bf16_vec()` instead.
     pub fn to_f16_vec(&self) -> Result<Vec<half::f16>> {
         match self.dtype {
             Dtype::F16 => Ok(self.data
@@ -70,6 +73,29 @@ impl RawTensor {
         }
     }
 
+    /// Convert raw bytes to a `Vec<half::bf16>`, preserving BF16 bit-exactly.
+    /// This is the correct loader for models stored/trained in BF16 (e.g. this
+    /// MOSS model), so GPU compute in BF16 matches the Python original node-by-node.
+    pub fn to_bf16_vec(&self) -> Result<Vec<half::bf16>> {
+        match self.dtype {
+            Dtype::BF16 => Ok(self.data
+                .chunks_exact(2)
+                .map(|c| half::bf16::from_ne_bytes([c[0], c[1]]))
+                .collect()),
+            Dtype::F32 => Ok(self.data
+                .chunks_exact(4)
+                .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+                .map(half::bf16::from_f32)
+                .collect()),
+            Dtype::F16 => Ok(self.data
+                .chunks_exact(2)
+                .map(|c| half::f16::from_ne_bytes([c[0], c[1]]).to_f32())
+                .map(half::bf16::from_f32)
+                .collect()),
+            other => Err(anyhow!("unsupported dtype {:?} for to_bf16_vec", other)),
+        }
+    }
+
     /// (f32_data, shape) — convenience for loaders that need both.
     pub fn as_f32(&self) -> Result<(Vec<f32>, Vec<usize>)> {
         Ok((self.to_f32_vec()?, self.shape.clone()))
@@ -78,5 +104,10 @@ impl RawTensor {
     /// (f16_data, shape) — convenience for loaders that need both.
     pub fn as_f16(&self) -> Result<(Vec<half::f16>, Vec<usize>)> {
         Ok((self.to_f16_vec()?, self.shape.clone()))
+    }
+
+    /// (bf16_data, shape) — convenience for loaders that need both.
+    pub fn as_bf16(&self) -> Result<(Vec<half::bf16>, Vec<usize>)> {
+        Ok((self.to_bf16_vec()?, self.shape.clone()))
     }
 }
