@@ -1,0 +1,210 @@
+use anyhow::{anyhow, Result};
+use regex::Regex;
+use serde::Serialize;
+use std::path::Path;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TranscriptPlan {
+    pub audio: String,
+    pub model: String,
+    pub mode: String,
+    pub lang: String,
+    pub prompt: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SilenceGap {
+    pub start: f32,
+    pub end: f32,
+    pub dur_ms: f32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PlannedChunk {
+    pub index: usize,
+    pub start: f32,
+    pub end: f32,
+    pub cut_reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AsrWindow {
+    pub index: usize,
+    pub plan_start: f32,
+    pub plan_end: f32,
+    pub audio_start: f32,
+    pub audio_end: f32,
+    pub overlap_sec: f32,
+    pub pad_left: f32,
+    pub pad_right: f32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Segment {
+    pub id: String,
+    pub start: f32,
+    pub end: f32,
+    pub speaker: String,
+    pub text: String,
+    pub chunk: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TranscriptionResult {
+    pub raw_transcript: String,
+    pub plain_text: String,
+    pub segments: Vec<Segment>,
+    pub chunks: Vec<PlannedChunk>,
+    pub asr_windows: Vec<AsrWindow>,
+    pub duration_sec: f32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TranscriptPlanFull {
+    pub audio: String,
+    pub model: String,
+    pub mode: String,
+    pub lang: String,
+    pub prompt: String,
+    pub duration_sec: f32,
+    pub chunk_sec: f32,
+    pub overlap_sec: f32,
+    pub min_silence_ms: f32,
+    pub min_silence_fallback_ms: f32,
+    pub silence_lookback_sec: f32,
+    pub chunks: Vec<PlannedChunk>,
+    pub asr_windows: Vec<AsrWindow>,
+    pub status: String,
+}
+
+pub fn load_wav_mono(path: &Path) -> Result<(Vec<f32>, u32)> {
+    let mut reader = hound::WavReader::open(path)?;
+    let spec = reader.spec();
+    let sr = spec.sample_rate;
+    let chans = spec.channels.max(1) as usize;
+    let samples: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Float => {
+            let raw: Result<Vec<f32>, _> = reader.samples::<f32>().collect();
+            raw?
+        }
+        hound::SampleFormat::Int => {
+            let bits = spec.bits_per_sample.max(1) as u32;
+            let max = ((1i64 << (bits.saturating_sub(1))) - 1) as f32;
+            let raw: Result<Vec<i32>, _> = reader.samples::<i32>().collect();
+            raw?.into_iter().map(|s| (s as f32 / max).clamp(-1.0, 1.0)).collect()
+        }
+    };
+    let mono = if chans == 1 { samples } else { samples.chunks(chans).map(|frame| frame.iter().copied().sum::<f32>() / chans as f32).collect() };
+    Ok((mono, sr))
+}
+
+pub fn duration_sec(samples: &[f32], sr: u32) -> f32 { samples.len() as f32 / sr as f32 }
+
+pub fn build_prompt(mode: &str, lang: &str, hotwords: Option<&str>, prompt_override: Option<&str>) -> Result<String> {
+    if let Some(prompt) = prompt_override { return Ok(prompt.trim().to_string()); }
+    let prompt = match (mode, lang) {
+        ("default", "zh") => "请将音频转写为文本，每一段需以起始时间戳和说话人编号（[S01]、[S02]、[S03]…）开头，正文为对应的语音内容，并在段末标注结束时间戳，以清晰标明该段语音范围。",
+        ("default", "en") => "Transcribe the audio. For each segment, start with the timestamp and speaker ID ([S01], [S02], [S03], ...), then the spoken text, and end with the segment timestamp.",
+        ("speaker", "zh") => "转录为文本，使用 [S01] [S02] [S03]等说话人标签。",
+        ("speaker", "en") => "Transcribe the audio as text using speaker labels such as [S01], [S02], and [S03].",
+        ("hotword", "zh") => {
+            let hw = hotwords.ok_or_else(|| anyhow!("--mode hotword requires --hotwords"))?;
+            return Ok(format!("请将音频转写为文本，每一段需以起始时间戳和说话人编号（[S01]、[S02]、[S03]…）开头，正文为对应的语音内容，并在段末标注结束时间戳，以清晰标明该段语音范围。热词提示：{}", hw.trim()));
+        }
+        ("hotword", "en") => {
+            let hw = hotwords.ok_or_else(|| anyhow!("--mode hotword requires --hotwords"))?;
+            return Ok(format!("Transcribe the audio. For each segment, start with the timestamp and speaker ID ([S01], [S02], [S03], ...), then the spoken text, and end with the segment timestamp. Hotwords: {}", hw.trim()));
+        }
+        _ => return Err(anyhow!("unknown mode/lang: {}/{}", mode, lang)),
+    };
+    Ok(prompt.to_string())
+}
+
+pub fn strip_tags(text: &str) -> String {
+    let re_speaker = Regex::new(r"\[S\d+\]").unwrap();
+    let re_ts = Regex::new(r"\[\d+(?:\.\d+)?\]").unwrap();
+    re_ts.replace_all(&re_speaker.replace_all(text, ""), "").replace("  ", " ").trim().to_string()
+}
+
+pub fn shift_timestamps(text: &str, offset: f32) -> String {
+    if offset.abs() < 1e-9 { return text.to_string(); }
+    let ts = Regex::new(r"\[(\d+(?:\.\d+)?)\]").unwrap();
+    ts.replace_all(text, |caps: &regex::Captures| {
+        let t: f32 = caps[1].parse().unwrap_or(0.0);
+        format!("[{:.2}]", t + offset)
+    }).to_string()
+}
+
+pub fn segments_to_raw_transcript(segments: &[Segment]) -> String {
+    let mut out = String::new();
+    for seg in segments {
+        let speaker = if seg.speaker.starts_with("[S") && seg.speaker.ends_with(']') {
+            seg.speaker.trim_matches(['[', ']'].as_ref()).to_string()
+        } else if seg.speaker.starts_with('S') {
+            seg.speaker.clone()
+        } else {
+            "S01".to_string()
+        };
+        out.push_str(&format!("[{:.2}][{}]{}[{:.2}]", seg.start, speaker, seg.text, seg.end));
+    }
+    out
+}
+
+pub fn plan_chunks(duration: f32, chunk_sec: f32) -> Vec<PlannedChunk> {
+    if duration <= chunk_sec + 1e-3 {
+        return vec![PlannedChunk { index: 0, start: 0.0, end: duration, cut_reason: "short".to_string() }];
+    }
+    let mut out = vec![];
+    let mut start = 0.0_f32;
+    let mut idx = 0usize;
+    while start < duration - 1e-3 {
+        let end = (start + chunk_sec).min(duration);
+        out.push(PlannedChunk { index: idx, start: (start * 1000.0).round() / 1000.0, end: (end * 1000.0).round() / 1000.0, cut_reason: if idx == 0 { "start".to_string() } else { "hard".to_string() } });
+        idx += 1;
+        start = end;
+    }
+    out
+}
+
+pub fn expand_chunks_with_overlap(chunks: &[PlannedChunk], duration: f32, overlap_sec: f32) -> Vec<AsrWindow> {
+    if chunks.is_empty() { return vec![]; }
+    if overlap_sec <= 1e-6 || chunks.len() == 1 {
+        return chunks.iter().map(|c| AsrWindow { index: c.index, plan_start: c.start, plan_end: c.end, audio_start: c.start, audio_end: c.end, overlap_sec: 0.0, pad_left: 0.0, pad_right: 0.0 }).collect();
+    }
+    let half = overlap_sec / 2.0;
+    let mut out = Vec::with_capacity(chunks.len());
+    for (i, c) in chunks.iter().enumerate() {
+        let plan_len = (c.end - c.start).max(0.0);
+        let side = half.min((plan_len * 0.25).max(0.5));
+        let audio_start = if i == 0 { c.start } else { (c.start - side).max(0.0) };
+        let audio_end = if i + 1 == chunks.len() { c.end } else { (c.end + side).min(duration) };
+        out.push(AsrWindow { index: c.index, plan_start: c.start, plan_end: c.end, audio_start, audio_end, overlap_sec, pad_left: (c.start - audio_start).max(0.0), pad_right: (audio_end - c.end).max(0.0) });
+    }
+    out
+}
+
+pub fn dummy_transcribe(plan: &TranscriptPlanFull) -> TranscriptionResult {
+    let segments = plan
+        .chunks
+        .iter()
+        .map(|c| Segment {
+            id: format!("seg_{:04}", c.index + 1),
+            start: c.start,
+            end: c.end,
+            speaker: "S01".to_string(),
+            text: String::new(),
+            chunk: Some(c.index),
+        })
+        .collect::<Vec<_>>();
+    let raw_transcript = segments_to_raw_transcript(&segments);
+    let plain_text = strip_tags(&raw_transcript);
+    TranscriptionResult {
+        raw_transcript,
+        plain_text,
+        segments,
+        chunks: plan.chunks.clone(),
+        asr_windows: plan.asr_windows.clone(),
+        duration_sec: plan.duration_sec,
+    }
+}

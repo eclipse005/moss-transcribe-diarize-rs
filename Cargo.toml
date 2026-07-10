@@ -1,0 +1,46 @@
+[package]
+name = "moss-transcribe-diarize-rs"
+version = "0.1.0"
+edition = "2024"
+description = "Rust + hand-written CUDA inference port of MOSS-Transcribe-Diarize (Whisper + Qwen3 ASR)"
+license = "MIT"
+
+[dependencies]
+half = { version = "2" }
+# mmap + zero-copy slice for safetensors weight loading. bytes is pinned to
+# >=1.11 for Bytes::from_owner (see qwen3-asr-rs weights.rs).
+memmap2 = "0.9"
+bytes = "1.11"
+cudarc = { version = "0.19", features = ["cublas", "f16", "cuda-version-from-build-system", "cuda-12080"], optional = true }
+gemm = "0.18"
+rayon = "1.10"
+tokenizers = { version = "0.22", features = ["onig"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hound = "3"
+rustfft = "6"
+rubato = "0.15"
+anyhow = "1"
+log = "0.4"
+safetensors = "0.4"
+thiserror = "2"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+regex = "1"
+env_logger = "0.11"
+
+[features]
+# Default = cuda: end-to-end transcribe works out of the box on a CUDA host.
+# CPU path also works end-to-end (--no-default-features).
+# Both backends store weights as f16, compute as f32.
+default = ["cuda"]
+cuda = ["dep:cudarc"]
+cpu = []           # No-op: CPU inference is always available.
+
+[dev-dependencies]
+env_logger = "0.11"
+
+[[bin]]
+name = "moss-transcribe"
+path = "src/main.rs"
