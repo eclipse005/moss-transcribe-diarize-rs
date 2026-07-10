@@ -77,6 +77,7 @@ struct AsrInner {
 struct GpuStack {
     cuda: std::sync::Arc<crate::cudarc_engine::CudaState>,
     encoder: crate::gpu_whisper::GpuWhisperEncoder,
+    adaptor: crate::cudarc_engine::GpuVqAdaptor,
     decoder: crate::cudarc_engine::GpuTextDecoder,
 }
 
@@ -125,8 +126,15 @@ impl AsrInference {
                             Ok(d) => d,
                             Err(e) => { log::warn!("GPU decoder load failed ({e}); using CPU"); return Self::finish_cpu(config, pc, tokenizer, mel, encoder, adaptor, decoder, weight_data, tokens); }
                         };
-                        log::info!("GPU stack loaded: Whisper encoder + Qwen3 decoder (cuda backend)");
-                        Some(GpuStack { cuda, encoder: gpu_enc, decoder: gpu_dec })
+                        let gpu_adaptor = match crate::cudarc_engine::GpuVqAdaptor::load(
+                            cuda.clone(), &weight_data, "model.vq_adaptor",
+                            config.text_config.hidden_size, config.text_config.rms_norm_eps as f32,
+                        ) {
+                            Ok(a) => a,
+                            Err(e) => { log::warn!("GPU adaptor load failed ({e}); using CPU"); return Self::finish_cpu(config, pc, tokenizer, mel, encoder, adaptor, decoder, weight_data, tokens); }
+                        };
+                        log::info!("GPU stack loaded: Whisper encoder + VQAdaptor + Qwen3 decoder (cuda backend)");
+                        Some(GpuStack { cuda, encoder: gpu_enc, adaptor: gpu_adaptor, decoder: gpu_dec })
                     }
                     Err(e) => { log::warn!("CUDA init failed ({e}); using CPU"); None }
                 }
@@ -227,9 +235,16 @@ impl AsrInner {
         let tt = std::time::Instant::now();
         #[cfg(feature = "cuda")]
         if let Some(gpu) = self.gpu.as_ref() { gpu.encoder.synchronize().ok(); }
+        #[cfg(feature = "cuda")]
+        let audio_embeds = if self.gpu.is_some() {
+            self.encode_audio_gpu(&input_features, num_mel, &feature_lengths, &chunk_mapping)?
+        } else {
+            self.encode_audio(&input_features, n_chunks, num_mel, &feature_lengths, &chunk_mapping)?
+        };
+        #[cfg(not(feature = "cuda"))]
         let audio_embeds = self.encode_audio(
             &input_features, n_chunks, num_mel, &feature_lengths, &chunk_mapping,
-        )?; // [nat, hidden]
+        )?;
         #[cfg(feature = "cuda")]
         if let Some(gpu) = self.gpu.as_ref() { gpu.encoder.synchronize().ok(); }
         t_encode = tt.elapsed();
@@ -425,6 +440,72 @@ impl AsrInner {
         Ok((t_prefill, td.elapsed(), generated, current_pos))
     }
 
+
+    /// GPU encode: encoder → trim → concat → time_merge(reshape) → GPU VQAdaptor.
+    /// All on GPU; downloads only the final [nat, hidden] audio embeds once.
+    #[cfg(feature = "cuda")]
+    fn encode_audio_gpu(
+        &self,
+        input_features: &[f32],
+        num_mel: usize,
+        feature_lengths: &[usize],
+        chunk_mapping: &[usize],
+    ) -> Result<Vec<f32>> {
+        use crate::cudarc_engine::GpuTensor;
+        use half::bf16;
+        let gpu = self.gpu.as_ref().unwrap();
+        let cuda = &gpu.cuda;
+        let nb_frames = self.pc.nb_max_frames;
+        let d_model = self.config.audio_config.d_model;
+        let merge = self.pc.audio_merge_size;
+        let hidden = self.config.text_config.hidden_size;
+
+        let num_audios = chunk_mapping.iter().copied().max().map(|m| m + 1).unwrap_or(0);
+        let mut per_audio_chunks: Vec<Vec<(usize, usize)>> = vec![Vec::new(); num_audios];
+        for (ci, &tl) in feature_lengths.iter().enumerate() {
+            per_audio_chunks[chunk_mapping[ci]].push((ci, tl));
+        }
+
+        let mut adapted_all = Vec::new();
+        for parts in &per_audio_chunks {
+            // Encode each chunk on GPU → trim to tl*4 → collect trimmed GPU tensors.
+            let mut cat_t = 0usize;
+            let mut cat_chunks: Vec<GpuTensor> = Vec::new();
+            for &(ci, tl) in parts {
+                let chunk_mel = &input_features[ci * num_mel * nb_frames..(ci + 1) * num_mel * nb_frames];
+                let enc = gpu.encoder.forward_gpu(chunk_mel, num_mel, nb_frames)?; // [1, T_out, d_model]
+                let t_out = enc.shape()[1];
+                let keep = (tl * 4).min(t_out);
+                // slice [1, keep, d_model] from [1, t_out, d_model]
+                let sliced = cuda.slice_dim1(&enc, 0, keep)?;
+                cat_t += keep;
+                cat_chunks.push(sliced);
+            }
+            // Concat along dim 1 → [1, cat_t, d_model]
+            let mut cat_data = cat_chunks[0].data.clone();
+            let total_cat = cat_t * d_model;
+            let mut full = unsafe { cuda.stream.alloc::<bf16>(total_cat)? };
+            let mut offset = 0usize;
+            for chunk in &cat_chunks {
+                let n = chunk.data.len();
+                cuda.stream.memcpy_dtod(&chunk.data.slice(..), &mut full.slice_mut(offset..offset + n))?;
+                offset += n;
+            }
+            let cat = GpuTensor::new(full, vec![1, cat_t, d_model]);
+            // time_merge: (1, cat_t, d_model) → (1, cat_t//merge, d_model*merge)
+            // This is a pure reshape (contiguous frames grouped). Trim to multiple of merge first.
+            let t_trim = (cat_t / merge) * merge;
+            let trimmed = if t_trim == cat_t { cat } else { cuda.slice_dim1(&cat, 0, t_trim)? };
+            let merged = trimmed.reshape(vec![1, t_trim / merge, d_model * merge]);
+            // GPU VQAdaptor: [1, out_t, d_model*merge] → [1, out_t, hidden]
+            let adapted = gpu.adaptor.forward(cuda, &merged)?;
+            let out_t = adapted.shape()[1];
+            // Download once
+            let host = cuda.download_tensor(&adapted)?;
+            adapted_all.extend(host.data.iter().take(out_t * hidden).map(|&v| v.to_f32()));
+        }
+        Ok(adapted_all)
+    }
 
     /// Encode audio: Whisper encoder per chunk → trim → concat → time_merge → VQAdaptor.
     /// Returns [nat, hidden] f32 (hidden = text hidden_size).

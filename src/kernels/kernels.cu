@@ -218,6 +218,19 @@ silu_mul_split_f16(
     }
 }
 
+// ─── In-place SiLU (VQAdaptor activation): x = x * sigmoid(x) ──────
+extern "C" __global__ void __launch_bounds__(1024, 2)
+silu_inplace_f16(
+    __half* __restrict__ x,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float v = __half2float(x[i]);
+    float sig = 1.0f / (1.0f + __expf(-v));
+    x[i] = __float2half(v * sig);
+}
+
 // ─── Softmax with scale + optional causal mask ─────────────────────
 // x shape (logical [bh, m, n]) launched as grid = (bh * m,). One block per row.
 // is_causal != 0 keeps positions [0..row_in_m+1) only.

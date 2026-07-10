@@ -77,6 +77,7 @@ pub(crate) struct CudaKernels {
     pub add_inplace: CudaFunction,
     pub silu_mul: CudaFunction,
     pub silu_mul_split: CudaFunction,
+    pub silu_inplace: CudaFunction,
     pub softmax_causal: CudaFunction,
     pub rotary_emb: CudaFunction,
     pub rms_norm_rotary: CudaFunction,
@@ -158,6 +159,7 @@ impl CudaState {
             add_inplace: module.load_function("add_inplace_f16")?,
             silu_mul: module.load_function("silu_mul_f16")?,
             silu_mul_split: module.load_function("silu_mul_split_f16")?,
+            silu_inplace: module.load_function("silu_inplace_f16")?,
             softmax_causal: module.load_function("softmax_scaled_causal_f16")?,
             rotary_emb: module.load_function("rotary_emb_f16")?,
             rms_norm_rotary: module.load_function("rms_norm_rotary_f16")?,
@@ -444,6 +446,17 @@ impl CudaState {
         let mut out_shape = gu.shape().to_vec();
         out_shape[nd - 1] = inter;
         Ok(GpuTensor::new(out, out_shape))
+    }
+
+    /// In-place SiLU: x = x * sigmoid(x). Used by the VQAdaptor (plain SiLU, not SwiGLU).
+    pub fn silu_inplace(&self, x: &mut GpuTensor) -> Result<()> {
+        let n = x.numel();
+        let cfg = LaunchConfig::for_num_elems(n as u32);
+        let n_i = n as i32;
+        let mut bb = self.stream.launch_builder(&self.k.silu_inplace);
+        bb.arg(&mut x.data); bb.arg(&n_i);
+        unsafe { bb.launch(cfg) }?;
+        Ok(())
     }
 
     /// scores [b,h,m,n] → softmax(scale * scores) with optional causal mask. Out of place.
@@ -946,6 +959,19 @@ impl CudaState {
         bb.arg(&d_i); bb.arg(&t_i); bb.arg(&bt_i);
         unsafe { bb.launch(cfg) }?;
         Ok(GpuTensor::new(out, x.shape().to_vec()))
+    }
+
+    /// Slice [1, S, D] → [1, len, D]: copy the first `len` tokens (each is D contiguous elements).
+    pub fn slice_dim1(&self, x: &GpuTensor, start: usize, len: usize) -> Result<GpuTensor> {
+        let s = x.shape();
+        assert_eq!(s.len(), 3);
+        let d = s[2];
+        assert!(start + len <= s[1]);
+        let elem = len * d;
+        let mut out = self.alloc_uninit_f16(elem)?;
+        let src_offset = start * d;
+        self.stream.memcpy_dtod(&x.data.slice(src_offset..src_offset + elem), &mut out)?;
+        Ok(GpuTensor::new(out, vec![1, len, d]))
     }
 
     /// Fused GQA attention for decode (s_q = 1).  Replaces repeat_kv + attention_qk + softmax + attention_av
@@ -1678,6 +1704,66 @@ pub(crate) fn compute_rope_cos_sin_f16(
     let cos = CpuTensor::new(cv.iter().map(|&v| bf16::from_f32(v)).collect(), vec![sl, head_dim]);
     let sin = CpuTensor::new(sv.iter().map(|&v| bf16::from_f32(v)).collect(), vec![sl, head_dim]);
     (cos, sin)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  GPU VQAdaptor (Linear → SiLU → Linear → LayerNorm), stays on device.
+// ═══════════════════════════════════════════════════════════════════════
+
+pub(crate) struct GpuVqAdaptor {
+    l0_w: GpuWeight, l0_b: CudaSlice<bf16>,   // Linear(input_dim → hidden)
+    l2_w: GpuWeight, l2_b: CudaSlice<bf16>,   // Linear(hidden → hidden)
+    ln_w: CudaSlice<bf16>, ln_b: CudaSlice<bf16>, // LayerNorm(hidden)
+    hidden: usize,
+    eps: f32,
+}
+
+impl GpuVqAdaptor {
+    pub fn load(cuda: Arc<CudaState>, weights: &HashMap<String, RawTensor>, prefix: &str,
+                hidden: usize, eps: f32) -> Result<Self> {
+        let g = |name: &str| -> Result<GpuWeight> { load_gpu_weight(&cuda, weights, name) };
+        let gv = |name: &str| -> Result<CudaSlice<bf16>> { load_gpu_vec(&cuda, weights, name) };
+        let p = |s: &str| format!("{}.{}", prefix, s);
+        Ok(Self {
+            l0_w: g(&p("layers.0.weight"))?,
+            l0_b: gv(&p("layers.0.bias"))?,
+            l2_w: g(&p("layers.2.weight"))?,
+            l2_b: gv(&p("layers.2.bias"))?,
+            ln_w: gv(&p("layers.3.weight"))?,
+            ln_b: gv(&p("layers.3.bias"))?,
+            hidden,
+            eps,
+        })
+    }
+
+    /// x: [1, T, input_dim] GPU. Returns [1, T, hidden] GPU.
+    /// Pipeline: Linear0(+bias) → SiLU → Linear2(+bias) → LayerNorm.
+    /// Note: this is NOT SwiGLU (no gate/up split) — it's plain SiLU on the
+    /// single Linear0 output, matching the Python VQAdaptor:
+    ///   Linear → SiLU → Linear → LayerNorm
+    pub fn forward(&self, cuda: &CudaState, x: &GpuTensor) -> Result<GpuTensor> {
+        // Linear0: [1, T, input_dim] → [1, T, hidden]
+        let mut h = cuda.linear_gpu(x, &self.l0_w)?;
+        cuda.add_bias_inplace(&mut h, &self.l0_b)?;
+        // SiLU (not silu_mul_split — there's no up/gate split here, just silu(x))
+        // We implement silu via a small elementwise: reuse silu_mul with a ones "up"?
+        // Actually SiLU(x) = x * sigmoid(x). We need a plain silu kernel.
+        // silu_mul_f16 expects (gate, up) separately. We can call it with up=ones,
+        // but that needs a separate ones buffer. Simpler: add a silu_inplace kernel.
+        // For now use a workaround: silu(x) = silu_mul(gate=x, up=1) — but we don't
+        // have a ones tensor. Let me just write silu_inplace inline via the existing
+        // gelu_inplace pattern... Actually SiLU ≠ GELU.
+        // Cleanest: apply silu elementwise by treating [h] as both gate and using
+        // a temporary ones buffer. But that's wasteful.
+        // BEST: add a silu_inplace_f16 kernel. For now, implement via host round-trip
+        // is too slow. Let me add the kernel to kernels.cu.
+        cuda.silu_inplace(&mut h)?;
+        // Linear2: [1, T, hidden] → [1, T, hidden]
+        let mut h2 = cuda.linear_gpu(&h, &self.l2_w)?;
+        cuda.add_bias_inplace(&mut h2, &self.l2_b)?;
+        // LayerNorm
+        cuda.layer_norm(&h2, &self.ln_w, &self.ln_b, self.eps)
+    }
 }
 
 #[cfg(all(test, feature = "cuda"))]

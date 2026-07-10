@@ -107,9 +107,17 @@ impl GpuWhisperEncoder {
 
     /// mel: [1, num_mel, nb_max_frames] f32 host → uploaded. Returns host [1, T_out*d_model] f32.
     pub fn forward_f32(&self, mel: &[f32], num_mel: usize, nb_frames: usize) -> Result<Vec<f32>> {
+        let h = self.forward_gpu(mel, num_mel, nb_frames)?;
+        let host = self.cuda.download_tensor(&h)?;
+        Ok(host.data.iter().map(|&v| v.to_f32()).collect())
+    }
+
+    /// mel: [1, num_mel, nb_max_frames] f32 host → uploaded. Returns GPU [1, T_out, d_model].
+    /// Stays on device — avoids D2H when the downstream time_merge + adaptor also run on GPU.
+    pub fn forward_gpu(&self, mel: &[f32], num_mel: usize, nb_frames: usize) -> Result<GpuTensor> {
         let b = 1usize;
-        let mel_f16: Vec<bf16> = mel.iter().map(|&v| bf16::from_f32(v)).collect();
-        let mel_gpu = self.cuda.upload_f16(&mel_f16)?;
+        let mel_bf16: Vec<bf16> = mel.iter().map(|&v| bf16::from_f32(v)).collect();
+        let mel_gpu = self.cuda.upload_f16(&mel_bf16)?;
         let mut x = GpuTensor::new(mel_gpu, vec![b, num_mel, nb_frames]);
         // conv1 (stride 1) + GELU, conv2 (stride 2) + GELU
         x = self.cuda.conv1d_k3_gelu(&x, &self.conv1_w, &self.conv1_b, num_mel, self.d_model, 1)?;
@@ -125,9 +133,7 @@ impl GpuWhisperEncoder {
         }
         // final layer_norm
         h = self.cuda.layer_norm(&h, &self.ln_w, &self.ln_b, self.eps)?;
-        // download → f32
-        let host = self.cuda.download_tensor(&h)?;
-        Ok(host.data.iter().map(|&v| v.to_f32()).collect())
+        Ok(h)
     }
 
     fn layer_forward(&self, layer: &GpuWhisperLayerData, x: GpuTensor) -> Result<GpuTensor> {
