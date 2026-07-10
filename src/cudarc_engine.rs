@@ -1557,10 +1557,6 @@ impl GpuDecoderLayer {
         let cur_len = kv_start + 1;
 
         // 5. Attention. Single-block fused_gqa_decode for all context lengths.
-        //    The split-K path is numerically correct (matches single-block to <0.6% rel),
-        //    but that bf16 round-off divergence accumulates across 28 layers × 600+ tokens
-        //    and causes output divergence vs the Python reference. Single-block matches
-        //    Python's cuBLAS attention more closely and stays aligned.
         let scale = 1.0f32 / (self.hd as f32).sqrt();
         cuda.fused_gqa_decode_into(
             &scratch.q_out, &kv.k[layer_idx], &kv.v[layer_idx],
