@@ -13,6 +13,7 @@ pub mod mel;
 pub mod mrope;
 pub mod processor;
 pub mod raw_tensor;
+pub mod resampler;
 pub mod transcript;
 pub mod whisper;
 #[cfg(feature = "cuda")]

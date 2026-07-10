@@ -6,9 +6,12 @@ pub(crate) const N_FFT: usize = 400;
 pub(crate) const HOP_LENGTH: usize = 160;
 
 fn hann_window(n: usize) -> Vec<f32> {
+    // Periodic Hann window (2πi/N), matching Python's window_function(n, "hann")
+    // which is periodic — NOT symmetric (2πi/(N-1)). Using symmetric was a source
+    // of mel divergence vs the Python reference.
     (0..n)
         .map(|i| {
-            let x = 2.0 * std::f32::consts::PI * i as f32 / (n as f32 - 1.0);
+            let x = 2.0 * std::f32::consts::PI * i as f32 / n as f32;
             0.5 * (1.0 - x.cos())
         })
         .collect()
@@ -41,22 +44,27 @@ fn compute_power_stft(
         0
     };
 
-    let mut planner = FftPlanner::<f32>::new();
+    // Use f64 for the FFT, matching Python's np.fft which promotes to float64
+    // internally. f32 FFT accumulates enough twiddle-factor error to diverge
+    // in the power spectrum (max-abs ~0.8 in the resulting mel), which then
+    // shifts rare timestamp tokens vs the Python reference.
+    let mut planner = FftPlanner::<f64>::new();
     let fft = planner.plan_fft_forward(n_fft);
 
     let mut power = vec![0.0f32; n_freqs * n_frames];
-    let mut frame_buf = vec![Complex::new(0.0f32, 0.0f32); n_fft];
+    let mut frame_buf = vec![Complex::new(0.0f64, 0.0f64); n_fft];
+    let window_f64: Vec<f64> = window.iter().map(|&v| v as f64).collect();
 
     for i in 0..n_frames {
         let start = i * hop_length;
         for j in 0..n_fft {
-            frame_buf[j] = Complex::new(signal[start + j] * window[j], 0.0);
+            frame_buf[j] = Complex::new(signal[start + j] as f64 * window_f64[j], 0.0);
         }
         fft.process(&mut frame_buf);
         for k in 0..n_freqs {
             let re = frame_buf[k].re;
             let im = frame_buf[k].im;
-            power[k * n_frames + i] = re * re + im * im;
+            power[k * n_frames + i] = (re * re + im * im) as f32;
         }
     }
 
@@ -160,20 +168,49 @@ impl MelExtractor {
         }
     }
 
+    /// Build with a pre-computed mel filterbank, laid out row-major as
+    /// `[num_mel_bins, n_freqs]` (one filter per row). This lets us load the
+    /// exact same filterbank the Python WhisperFeatureExtractor uses, so the
+    /// mel step is bit-identical (the generated filterbank is the main source
+    /// of mel divergence vs HF's slaney implementation).
+    pub fn new_with_filters(
+        n_fft: usize,
+        hop_length: usize,
+        num_mel_bins: usize,
+        mel_filters: Vec<f32>,
+    ) -> Self {
+        let n_freqs = n_fft / 2 + 1;
+        assert_eq!(mel_filters.len(), num_mel_bins * n_freqs,
+            "mel_filters must be [num_mel_bins={}, n_freqs={}] = {} elems, got {}",
+            num_mel_bins, n_freqs, num_mel_bins * n_freqs, mel_filters.len());
+        Self { n_fft, hop_length, num_mel_bins, mel_filters, n_freqs }
+    }
+
     pub fn mel_bins(&self) -> usize { self.num_mel_bins }
 
     pub(crate) fn extract(&self, samples: &[f32]) -> Result<(Vec<f32>, usize, usize)> {
-        let padded_len = samples.len().div_ceil(self.hop_length) * self.hop_length;
-        let mut padded_samples = samples.to_vec();
-        padded_samples.resize(padded_len, 0.0);
-
+        // Do NOT zero-pad to a hop_length multiple first — Python's spectrogram()
+        // reflects the raw waveform and then drops any trailing partial frame
+        // via num_frames = 1 + floor((len - frame_length)/hop). Zero-padding
+        // before reflection changes the boundary samples and was a source of
+        // mel divergence vs the Python reference.
         let pad = self.n_fft / 2;
-        let padded_signal = reflection_pad(&padded_samples, pad);
+        let padded_signal = reflection_pad(samples, pad);
 
         let window = hann_window(self.n_fft);
 
         let (power, _n_freqs, n_frames_with_last) =
             compute_power_stft(&padded_signal, self.n_fft, self.hop_length, &window);
+
+        // DIAG: dump raw power spectrum [n_freqs, n_frames_with_last] for alignment comparison
+        if let Ok(dir) = std::env::var("MOSS_POWER_DUMP") {
+            let _ = std::fs::create_dir_all(&dir);
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::File::create(std::path::Path::new(&dir).join("rust_power.bin")) {
+                let bytes: Vec<u8> = power.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let _ = f.write_all(&bytes);
+            }
+        }
 
         let n_frames = if n_frames_with_last > 0 {
             n_frames_with_last - 1
@@ -295,21 +332,8 @@ fn load_audio_wav_impl(path: &str, target_sr: u32) -> anyhow::Result<Vec<f32>> {
         return Ok(mono);
     }
 
-    use rubato::{
-        Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
-    };
-
-    let params = SincInterpolationParameters {
-        sinc_len: 256,
-        f_cutoff: 0.95,
-        interpolation: SincInterpolationType::Linear,
-        oversampling_factor: 256,
-        window: WindowFunction::BlackmanHarris2,
-    };
-
-    let mut resampler =
-        SincFixedIn::<f32>::new(target_sr as f64 / sr as f64, 2.0, params, mono.len(), 1)?;
-
-    let output = resampler.process(&[mono], None)?;
-    Ok(output.into_iter().next().unwrap_or_default())
+    // Use the soxr_hq-compatible polyphase Kaiser resampler (matches librosa's
+    // soxr_hq output for node-level alignment with the Python reference).
+    // rubato's sinc resampler produced different samples → mel divergence.
+    Ok(crate::resampler::resample_mono(&mono, sr, target_sr))
 }

@@ -33,6 +33,31 @@ pub struct AsrInference {
     inner: Mutex<AsrInner>,
 }
 
+/// Build the MelExtractor using the exact mel filterbank the Python
+/// WhisperFeatureExtractor computes (dumped to data/whisper_mel_filters.bin).
+/// Using HF's slaney filterbank bit-for-bit eliminates the largest source of
+/// mel divergence. Falls back to the librosa-style generated filterbank if the
+/// data file is missing.
+fn load_mel_extractor(n_fft: usize, hop_length: usize, num_mel_bins: usize) -> MelExtractor {
+    let path = std::path::Path::new("data/whisper_mel_filters.bin");
+    if let Ok(bytes) = std::fs::read(path) {
+        let n_freqs = n_fft / 2 + 1;
+        let expected = num_mel_bins * n_freqs * 4;
+        if bytes.len() == expected {
+            let filters: Vec<f32> = bytes.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            log::info!("loaded Python-exact mel filterbank from {} ({} filters x {} freqs)",
+                path.display(), num_mel_bins, n_freqs);
+            return MelExtractor::new_with_filters(n_fft, hop_length, num_mel_bins, filters);
+        }
+        log::warn!("mel filterbank file size mismatch ({} vs {}), falling back to generated", bytes.len(), expected);
+    } else {
+        log::warn!("mel filterbank file not found at {}, using generated (slaney) filterbank", path.display());
+    }
+    MelExtractor::new(n_fft, hop_length, num_mel_bins, MEL_SAMPLE_RATE)
+}
+
 struct AsrInner {
     config: MossConfig,
     pc: ProcessorConfig,
@@ -71,7 +96,7 @@ impl AsrInference {
         let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
             .map_err(|e| anyhow!("tokenizer load failed: {}", e))?;
 
-        let mel = MelExtractor::new(N_FFT, HOP_LENGTH, config.audio_config.num_mel_bins, MEL_SAMPLE_RATE);
+        let mel = load_mel_extractor(N_FFT, HOP_LENGTH, config.audio_config.num_mel_bins);
         let pc = ProcessorConfig::default();
 
         let encoder = CpuWhisperEncoder::load(&weight_data, "model.whisper_encoder", &config.audio_config)?;
