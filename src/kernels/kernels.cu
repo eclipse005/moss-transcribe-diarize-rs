@@ -1000,28 +1000,29 @@ fused_gqa_decode_split_p1_f16(
 
     int t_start = by * chunk_size;
     int t_end = min(t_start + chunk_size, cur_len);
+    int meta_idx = (ib * nqh + qh) * n_chunks + by;
     if (t_start >= cur_len) {
         if (tid == 0) {
-            part_max[(ib * nqh + qh) * n_chunks + by] = -INFINITY;
-            part_sum[(ib * nqh + qh) * n_chunks + by] = 0.0f;
+            part_max[meta_idx] = -INFINITY;
+            part_sum[meta_idx] = 0.0f;
         }
-        if (tid < d) part_out[((ib * nqh + qh) * n_chunks + by) * d + tid] = 0.0f;
+        if (tid < d) part_out[meta_idx * d + tid] = 0.0f;
         return;
     }
     int chunk_len = t_end - t_start;
 
     extern __shared__ float smem[];   // scores[chunk_size]
-    __shared__ __half q_smem[128];    // d=128, Q cached in shared mem (256 bytes)
+    __shared__ __half q_smem[128];    // d=128, Q cached in shared mem
 
     const __half* q_row  = q       + (ib * nqh  + qh) * d;
     const __half* k_base = k_cache + (ib * nkvh + kh) * max_seq * d + t_start * d;
     const __half* v_base = v_cache + (ib * nkvh + kh) * max_seq * d + t_start * d;
 
-    // Cooperatively load Q into shared memory (256 bytes)
+    // Cooperatively load Q into shared memory
     for (int j = tid; j < d; j += bs) q_smem[j] = q_row[j];
     __syncthreads();
 
-    // Stage 1: scores (vectorized with __half2, Q from shared mem)
+    // Stage 1: scores = Q · K^T * scale
     for (int t = tid; t < chunk_len; t += bs) {
         float dot = 0.0f;
         for (int j = 0; j < d; j += 2) {
@@ -1034,7 +1035,7 @@ fused_gqa_decode_split_p1_f16(
     }
     __syncthreads();
 
-    // Stage 2: chunk max
+    // Stage 2: chunk max (parallel reduce)
     float local_max = -INFINITY;
     for (int t = tid; t < chunk_len; t += bs) {
         if (smem[t] > local_max) local_max = smem[t];
@@ -1048,7 +1049,7 @@ fused_gqa_decode_split_p1_f16(
     }
     float chunk_max = reduce_buf[0];
 
-    // Stage 3: exp + sum
+    // Stage 3: exp(score - chunk_max) → smem, sum reduce
     float local_sum = 0.0f;
     for (int t = tid; t < chunk_len; t += bs) {
         float v = expf(smem[t] - chunk_max);
@@ -1063,34 +1064,39 @@ fused_gqa_decode_split_p1_f16(
     }
     float chunk_sum = reduce_buf[0];
 
-    // Stage 4: partial out (NOT normalized — we let phase 2 do that with merged sum)
-    // Use t-chunks layout for d=128, bs=256 → t_chunks=2.
-    int t_split = bs / d;
-    if (t_split < 1) t_split = 1;
-    int j_idx = tid % d;
-    int t_idx = tid / d;
-    // Shared partial buffer at smem[chunk_size..].
-    float* partial = smem + chunk_size;
-    if (j_idx < d && t_idx < t_split) {
-        float acc = 0.0f;
-        for (int t = t_idx; t < chunk_len; t += t_split) {
-            acc += smem[t] * __half2float(v_base[t * d + j_idx]);
+    // Stage 4: partial_out[j] = Σ_t attn[t] * V[t, j]  (attn not yet globally normalized).
+    // Each thread tid accumulates a strided sum over t for output dim j=tid%d,
+    // then we reduce the t_stride partials within each j-group via shared mem.
+    // We use bs threads (=256), d=128, so t_stride = bs/d = 2 threads per output dim.
+    int t_stride = bs / d;
+    if (t_stride < 1) t_stride = 1;
+    int j = tid % d;            // output dim this thread contributes to
+    int t_lane = tid / d;       // which stride-lane (0..t_stride-1)
+    float my_acc = 0.0f;
+    if (t_lane < t_stride) {
+        for (int t = t_lane; t < chunk_len; t += t_stride) {
+            my_acc += smem[t] * __half2float(v_base[t * d + j]);
         }
-        partial[t_idx * d + j_idx] = acc;
+    }
+    // Reduce t_stride lanes per j into part_out. Use reduce_buf[d * t_stride].
+    // Layout: reduce_buf[t_lane * d + j].
+    __shared__ float partial_out[256]; // covers up to d=128, t_stride=2
+    if (t_lane < t_stride) {
+        partial_out[t_lane * d + j] = my_acc;
     }
     __syncthreads();
+    if (tid < d) {
+        float acc = 0.0f;
+        for (int ti = 0; ti < t_stride; ti++) {
+            acc += partial_out[ti * d + tid];
+        }
+        part_out[meta_idx * d + tid] = acc;
+    }
 
-    int meta_idx = (ib * nqh + qh) * n_chunks + by;
+    // Write chunk metadata (after stage 4 so smem is no longer needed by this block).
     if (tid == 0) {
         part_max[meta_idx] = chunk_max;
         part_sum[meta_idx] = chunk_sum;
-    }
-    if (tid < d) {
-        float acc = 0.0f;
-        for (int ti = 0; ti < t_split; ti++) {
-            acc += partial[ti * d + tid];
-        }
-        part_out[meta_idx * d + tid] = acc;
     }
 }
 

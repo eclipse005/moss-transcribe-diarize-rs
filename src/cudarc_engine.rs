@@ -1530,11 +1530,11 @@ impl GpuDecoderLayer {
         )?;
         let cur_len = kv_start + 1;
 
-        // 5. Attention. Single-block fused_gqa_decode for all context lengths — it is both
-        //    correct and (empirically) the fastest path on this model/P104. The split-K path
-        //    has a divergence bug and the matmul (repeat_kv+qk+softmax+av) path is ~2.5x
-        //    slower due to repeat/alloc overhead. Optimizing long-context decode further is
-        //    future work (e.g. a fixed flash-attention kernel).
+        // 5. Attention. Single-block fused_gqa_decode for all context lengths.
+        //    The split-K path is numerically correct (matches single-block to <0.6% rel),
+        //    but that bf16 round-off divergence accumulates across 28 layers × 600+ tokens
+        //    and causes output divergence vs the Python reference. Single-block matches
+        //    Python's cuBLAS attention more closely and stays aligned.
         let scale = 1.0f32 / (self.hd as f32).sqrt();
         cuda.fused_gqa_decode_into(
             &scratch.q_out, &kv.k[layer_idx], &kv.v[layer_idx],
@@ -1678,4 +1678,59 @@ pub(crate) fn compute_rope_cos_sin_f16(
     let cos = CpuTensor::new(cv.iter().map(|&v| bf16::from_f32(v)).collect(), vec![sl, head_dim]);
     let sin = CpuTensor::new(sv.iter().map(|&v| bf16::from_f32(v)).collect(), vec![sl, head_dim]);
     (cos, sin)
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod split_tests {
+    use super::*;
+
+    /// Verify fused_gqa_decode_split_into matches fused_gqa_decode_into element-wise.
+    #[test]
+    fn split_matches_single_block() {
+        let cuda = CudaState::new(0).expect("cuda init");
+        let nqh = 16usize;
+        let nkvh = 8usize;
+        let hd = 128usize;
+        let max_seq = 2048usize;
+        let b = 1usize;
+
+        let total = b * nkvh * max_seq * hd;
+        let k_data: Vec<bf16> = (0..total).map(|i| bf16::from_f32(((i as f32) * 0.017).sin() * 0.5)).collect();
+        let v_data: Vec<bf16> = (0..total).map(|i| bf16::from_f32(((i as f32) * 0.013).cos() * 0.5)).collect();
+        let k_dev = cuda.upload_f16(&k_data).unwrap();
+        let v_dev = cuda.upload_f16(&v_data).unwrap();
+        let q_data: Vec<bf16> = (0..nqh * hd).map(|i| bf16::from_f32(((i as f32) * 0.011).sin() * 0.3)).collect();
+        let q_dev = cuda.upload_f16(&q_data).unwrap();
+        let scale = 1.0f32 / (hd as f32).sqrt();
+
+        for &cur_len in &[100usize, 500, 1100, 1500] {
+            let mut out_single = cuda.alloc_uninit_f16(nqh * hd).unwrap();
+            cuda.fused_gqa_decode_into(&q_dev, &k_dev, &v_dev, nqh, nkvh, max_seq, cur_len, scale, &mut out_single).unwrap();
+            cuda.synchronize().unwrap();
+            let single = cuda.download_f16(&out_single).unwrap();
+
+            let chunk_size = if cur_len >= 2048 { 512 } else { 256 };
+            let max_chunks = (max_seq + 255) / 256;
+            let mut part_out = cuda.stream.alloc_zeros::<f32>(nqh * max_chunks * hd).unwrap();
+            let mut part_max = cuda.stream.alloc_zeros::<f32>(nqh * max_chunks).unwrap();
+            let mut part_sum = cuda.stream.alloc_zeros::<f32>(nqh * max_chunks).unwrap();
+            let mut out_split = cuda.alloc_uninit_f16(nqh * hd).unwrap();
+            cuda.fused_gqa_decode_split_into(&q_dev, &k_dev, &v_dev, nkvh, max_seq, cur_len, scale, chunk_size, max_chunks, &mut part_out, &mut part_max, &mut part_sum, &mut out_split).unwrap();
+            cuda.synchronize().unwrap();
+            let split = cuda.download_f16(&out_split).unwrap();
+
+            let mut max_abs = 0.0f32;
+            let mut max_rel = 0.0f32;
+            for i in 0..nqh * hd {
+                let s = single[i].to_f32();
+                let p = split[i].to_f32();
+                let d = (s - p).abs();
+                if d > max_abs { max_abs = d; }
+                let rel = d / (s.abs() + 1e-6);
+                if rel > max_rel { max_rel = rel; }
+            }
+            eprintln!("cur_len={}: max_abs={:.6} max_rel={:.4}", cur_len, max_abs, max_rel);
+            assert!(max_rel < 0.05, "cur_len={}: split vs single rel diff {:.4} too large", cur_len, max_rel);
+        }
+    }
 }
