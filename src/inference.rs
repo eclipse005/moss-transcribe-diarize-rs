@@ -292,8 +292,11 @@ impl AsrInner {
         );
 
         // 6. Prefill + decode (GPU path when available, else CPU).
-        let eos_ids: &[i64] = &[self.tokens.endoftext, self.tokens.im_end];
-        log::debug!("eos_ids endoftext={} im_end={} audio_pad={}", self.tokens.endoftext, self.tokens.im_end, self.config.audio_token_id);
+        // Match Python generation_config.json: eos_token_id = 151645 (<|im_end|>) only.
+        // 151643 (<|endoftext|>) is the pad/bos token, NOT an eos — stopping on it would
+        // truncate generation if the model ever emits it mid-stream.
+        let eos_ids: &[i64] = &[self.tokens.im_end];
+        log::debug!("eos_ids im_end={} audio_pad={}", self.tokens.im_end, self.config.audio_token_id);
         let mut generated: Vec<u32> = Vec::new();
         let mut current_pos = seq_len;
 
