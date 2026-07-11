@@ -16,8 +16,8 @@
 ## 安装
 
 ```bash
-# 需要 Rust 1.85+ 和 CUDA 12.8+
-cargo build --release          # CUDA 后端（默认）
+# 需要 Rust 1.85+ (MSRV) 和 CUDA 12.8+（默认 feature）
+cargo build --release          # CUDA 后端（默认 features）
 cargo build --release --no-default-features  # 仅 CPU 后端
 ```
 
@@ -26,29 +26,29 @@ cargo build --release --no-default-features  # 仅 CPU 后端
 ### 命令行
 
 ```bash
-# 基本转写（使用默认英语 prompt，带时间戳和说话人）
-cargo run --release -- transcribe audio.wav
+# 模型路径：--model 或环境变量 MOSS_MODEL_DIR
+export MOSS_MODEL_DIR=/path/to/moss-transcribe-diarize
 
-# 指定后端
-cargo run --release -- transcribe audio.wav --backend cuda
-cargo run --release --no-default-features -- transcribe audio.wav --backend cpu
+# 基本转写（默认英语 prompt，带时间戳和说话人；默认 --backend cpu）
+cargo run --release -- transcribe audio.wav --model "$MOSS_MODEL_DIR"
+
+# 指定后端（auto | cpu | cuda | gpu；库侧 FromStr，CLI value_parser）
+cargo run --release -- transcribe audio.wav --model "$MOSS_MODEL_DIR" --backend cuda
+cargo run --release --no-default-features -- transcribe audio.wav --model "$MOSS_MODEL_DIR" --backend cpu
 
 # 热词（通过 prompt 注入）
-cargo run --release -- --prompt "Transcribe the audio. For each segment, start with the timestamp and speaker ID ([S01], [S02], [S03], ...), then the spoken text, and end with the segment timestamp. Hotwords: order block, swing trading" audio.wav
-
-# 自定义模型路径
-cargo run --release -- transcribe audio.wav --model /path/to/moss-transcribe-diarize
+cargo run --release -- transcribe audio.wav --model "$MOSS_MODEL_DIR" --prompt "Transcribe the audio. For each segment, start with the timestamp and speaker ID ([S01], [S02], [S03], ...), then the spoken text, and end with the segment timestamp. Hotwords: order block, swing trading"
 
 # 性能分析
-MOSS_BENCH=1 cargo run --release -- transcribe audio.wav
+MOSS_BENCH=1 cargo run --release -- transcribe audio.wav --model "$MOSS_MODEL_DIR" --backend cuda
 ```
 
 ### 作为库
 
 ```rust
-use moss_transcribe_diarize_rs::AsrInference;
+use moss_transcribe_diarize_rs::{AsrInference, Backend};
 
-let infer = AsrInference::load_with_backend("path/to/model", "cuda")?;
+let infer = AsrInference::load_with(std::path::Path::new("path/to/model"), Backend::Cuda)?;
 let text = infer.transcribe("audio.wav", &prompt, 2048)?;
 println!("{}", text);
 ```

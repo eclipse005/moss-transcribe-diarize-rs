@@ -1,24 +1,37 @@
 //! Backend selection — pure tag enum, no internal types.
 //!
-//! `Backend` is a lightweight selection tag.  Pass it to [`AsrInference::load`]
+//! `Backend` is a lightweight selection tag.  Pass it to [`crate::AsrInference::load_with`]
 //! to choose CPU or GPU.  The heavy lifting lives in `cudarc_engine` (GPU) and
 //! `cpu_engine` (CPU); this module just owns the dispatch.
+//!
+//! This type is intentionally free of CLI framework traits (`clap`, etc.).
+//! Parse strings with [`std::str::FromStr`] (or the binary's own value parser).
+
+use std::str::FromStr;
 
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
 
-/// Compute backend selection.  Pass to [`crate::AsrInference::load`] to choose.
+use crate::error::{AsrError, Result};
+
+/// Compute backend selection.  Pass to [`crate::AsrInference::load_with`] to choose.
 ///
 /// `Auto` detects the best available backend at load time (prefers CUDA when
 /// the `cuda` feature is enabled and a device is present; falls back to CPU).
+///
+/// **CUDA init failure contract (historical):** both `Auto` and explicit `Cuda`
+/// fall back to CPU with a warning if the device cannot be opened. Component
+/// loads (encoder / decoder / adaptor) that fail after a successful device open
+/// also fall back to CPU — see `AsrInference::load_with`.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Backend {
     /// Detect the best available backend at load time.
+    #[default]
     Auto,
     /// Force CPU inference.
     Cpu,
-    /// Force CUDA inference (GPU 0).
+    /// Prefer CUDA (GPU 0). If device init fails, falls back to CPU (historical).
     #[cfg(feature = "cuda")]
     Cuda,
 }
@@ -32,15 +45,27 @@ pub(crate) enum ResolvedBackend {
 }
 
 impl Backend {
-    /// Resolve `Auto` to a concrete backend; leave explicit choices unchanged.
-    pub(crate) fn resolve(self) -> anyhow::Result<ResolvedBackend> {
+    /// Resolve to a concrete backend handle.
+    ///
+    /// Never returns `Err` for device open failures: CUDA init errors become
+    /// [`ResolvedBackend::Cpu`] with a warning (matches the original stringly
+    /// `"cuda"` / `"auto"` load path). Callers may still fail later on weight load.
+    pub(crate) fn resolve(self) -> ResolvedBackend {
         match self {
-            Backend::Cpu => Ok(ResolvedBackend::Cpu),
+            Backend::Cpu => ResolvedBackend::Cpu,
             #[cfg(feature = "cuda")]
             Backend::Cuda => {
                 use crate::cudarc_engine::CudaState;
-                let state = CudaState::new(0)?;
-                Ok(ResolvedBackend::Cuda(Arc::new(state)))
+                match CudaState::new(0) {
+                    Ok(state) => {
+                        log::info!("Backend::Cuda: using CUDA device 0");
+                        ResolvedBackend::Cuda(Arc::new(state))
+                    }
+                    Err(e) => {
+                        log::warn!("CUDA init failed ({e}); using CPU");
+                        ResolvedBackend::Cpu
+                    }
+                }
             }
             Backend::Auto => {
                 #[cfg(feature = "cuda")]
@@ -49,26 +74,26 @@ impl Backend {
                     match CudaState::new(0) {
                         Ok(state) => {
                             log::info!("Auto: selected CUDA device 0");
-                            Ok(ResolvedBackend::Cuda(Arc::new(state)))
+                            ResolvedBackend::Cuda(Arc::new(state))
                         }
                         Err(e) => {
                             log::warn!("Auto: CUDA init failed ({e}); falling back to CPU");
-                            Ok(ResolvedBackend::Cpu)
+                            ResolvedBackend::Cpu
                         }
                     }
                 }
                 #[cfg(not(feature = "cuda"))]
                 {
                     log::info!("Auto: no GPU backend available, using CPU");
-                    Ok(ResolvedBackend::Cpu)
+                    ResolvedBackend::Cpu
                 }
             }
         }
     }
 
-    /// Backward-compatible convenience: returns `Backend::Auto`.
-    pub fn best() -> anyhow::Result<Self> {
-        Ok(Backend::Auto)
+    /// Prefer the best available backend (`Auto`).
+    pub fn best() -> Self {
+        Backend::Auto
     }
 
     /// Short human label — useful for logs.
@@ -79,5 +104,56 @@ impl Backend {
             #[cfg(feature = "cuda")]
             Backend::Cuda => "cuda:0",
         }
+    }
+}
+
+impl FromStr for Backend {
+    type Err = AsrError;
+
+    /// Parse `"auto" | "cpu" | "cuda" | "gpu"` (case-insensitive).
+    ///
+    /// Unknown tags and `"cuda"`/`"gpu"` on a build without the `cuda` feature
+    /// return [`AsrError::InvalidBackend`] (stricter than the old silent-CPU path).
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Backend::Auto),
+            "cpu" => Ok(Backend::Cpu),
+            #[cfg(feature = "cuda")]
+            "cuda" | "gpu" => Ok(Backend::Cuda),
+            #[cfg(not(feature = "cuda"))]
+            "cuda" | "gpu" => Err(AsrError::InvalidBackend(
+                "cuda requested but this build has no `cuda` feature".into(),
+            )),
+            other => Err(AsrError::InvalidBackend(format!(
+                "unknown backend {other:?}; expected auto|cpu{}",
+                if cfg!(feature = "cuda") {
+                    "|cuda|gpu"
+                } else {
+                    ""
+                }
+            ))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_backend_names() {
+        assert_eq!(Backend::from_str("auto").unwrap(), Backend::Auto);
+        assert_eq!(Backend::from_str("CPU").unwrap(), Backend::Cpu);
+        #[cfg(feature = "cuda")]
+        {
+            assert_eq!(Backend::from_str("cuda").unwrap(), Backend::Cuda);
+            assert_eq!(Backend::from_str("gpu").unwrap(), Backend::Cuda);
+        }
+        assert!(Backend::from_str("tpu").is_err());
+    }
+
+    #[test]
+    fn default_is_auto() {
+        assert_eq!(Backend::default(), Backend::Auto);
     }
 }

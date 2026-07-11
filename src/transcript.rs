@@ -1,3 +1,6 @@
+//! Chunking / transcript helpers (long-form pipeline scaffolding).
+#![allow(dead_code)]
+
 use anyhow::{anyhow, Result};
 use regex::Regex;
 use serde::Serialize;

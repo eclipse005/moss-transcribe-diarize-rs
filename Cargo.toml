@@ -2,6 +2,7 @@
 name = "moss-transcribe-diarize-rs"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 description = "Rust + hand-written CUDA inference port of MOSS-Transcribe-Diarize (Whisper + Qwen3 ASR)"
 license = "MIT"
 
@@ -25,7 +26,7 @@ safetensors = "0.4"
 thiserror = "2"
 
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 regex = "1"
 env_logger = "0.11"
 

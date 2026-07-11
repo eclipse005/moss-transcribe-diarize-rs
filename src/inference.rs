@@ -3,19 +3,23 @@
 //! CPU path first (node-by-node alignment with Python). CUDA path mirrors the
 //! structure once parity is proven.
 
-use anyhow::{anyhow, Result};
-use std::collections::HashMap;
+use anyhow::{anyhow, Result as AnyResult};
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::Mutex;
 
 use crate::adaptor::{time_merge, CpuVqAdaptor};
+use crate::backend::Backend;
 use crate::config::{MossConfig, ProcessorConfig};
 use crate::cpu_engine::{self, CpuKvCache, CpuTensor, CpuTextDecoder};
-use crate::error::AsrError;
+use crate::error::{AsrError, Result};
 use crate::mel::{load_audio_wav, MelExtractor, MEL_SAMPLE_RATE, N_FFT, HOP_LENGTH};
 use crate::processor::{audio_span_ids, audios_to_input_features};
-use crate::raw_tensor::RawTensor;
 use crate::whisper::{CpuEncTensor, CpuWhisperEncoder};
+
+/// Exact WhisperFeatureExtractor slaney mel filterbank (Python dump).
+/// Embedded so CWD does not affect load; bytes match `data/whisper_mel_filters.bin`.
+const EMBEDDED_MEL_FILTERS: &[u8] = include_bytes!("../data/whisper_mel_filters.bin");
 
 /// Token ids needed at prompt-build time (from tokenizer_config / added_tokens).
 pub struct SpecialTokens {
@@ -34,27 +38,31 @@ pub struct AsrInference {
 }
 
 /// Build the MelExtractor using the exact mel filterbank the Python
-/// WhisperFeatureExtractor computes (dumped to data/whisper_mel_filters.bin).
+/// WhisperFeatureExtractor computes (embedded from data/whisper_mel_filters.bin).
 /// Using HF's slaney filterbank bit-for-bit eliminates the largest source of
 /// mel divergence. Falls back to the librosa-style generated filterbank if the
-/// data file is missing.
+/// embedded blob size does not match the requested shape.
 fn load_mel_extractor(n_fft: usize, hop_length: usize, num_mel_bins: usize) -> MelExtractor {
-    let path = std::path::Path::new("data/whisper_mel_filters.bin");
-    if let Ok(bytes) = std::fs::read(path) {
-        let n_freqs = n_fft / 2 + 1;
-        let expected = num_mel_bins * n_freqs * 4;
-        if bytes.len() == expected {
-            let filters: Vec<f32> = bytes.chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
-            log::info!("loaded Python-exact mel filterbank from {} ({} filters x {} freqs)",
-                path.display(), num_mel_bins, n_freqs);
-            return MelExtractor::new_with_filters(n_fft, hop_length, num_mel_bins, filters);
-        }
-        log::warn!("mel filterbank file size mismatch ({} vs {}), falling back to generated", bytes.len(), expected);
-    } else {
-        log::warn!("mel filterbank file not found at {}, using generated (slaney) filterbank", path.display());
+    let n_freqs = n_fft / 2 + 1;
+    let expected = num_mel_bins * n_freqs * 4;
+    let bytes = EMBEDDED_MEL_FILTERS;
+    if bytes.len() == expected {
+        let filters: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        log::info!(
+            "loaded Python-exact mel filterbank from embedded bytes ({} filters x {} freqs)",
+            num_mel_bins,
+            n_freqs
+        );
+        return MelExtractor::new_with_filters(n_fft, hop_length, num_mel_bins, filters);
     }
+    log::warn!(
+        "embedded mel filterbank size mismatch ({} vs {}), falling back to generated",
+        bytes.len(),
+        expected
+    );
     MelExtractor::new(n_fft, hop_length, num_mel_bins, MEL_SAMPLE_RATE)
 }
 
@@ -68,7 +76,6 @@ struct AsrInner {
     decoder: CpuTextDecoder,
     #[cfg(feature = "cuda")]
     gpu: Option<GpuStack>,
-    weights: HashMap<String, RawTensor>,  // kept for node-dump alignment
     tokens: SpecialTokens,
 }
 
@@ -81,101 +88,212 @@ struct GpuStack {
     decoder: crate::cudarc_engine::GpuTextDecoder,
 }
 
-unsafe impl Send for AsrInner {}
+// AsrInner is Send when all fields are Send (tokenizer, tensors, optional CUDA).
+// Do not force `unsafe impl Send` — let the compiler verify.
 
 impl AsrInference {
+    /// Load with the CPU backend (historical default for `load()`).
+    /// Prefer [`Self::load_with`] + [`Backend::Auto`] when GPU is desired.
     pub fn load(model_dir: &Path) -> Result<Self> {
-        Self::load_with_backend(model_dir, "cpu")
+        Self::load_with(model_dir, Backend::Cpu)
     }
 
-    /// `backend` = "cpu" | "cuda" | "auto". cuda runs the Whisper encoder AND
-    /// the Qwen3 decoder on GPU; the VQAdaptor + time-merge still run on CPU
-    /// (small, alignment-proven).
-    pub fn load_with_backend(model_dir: &Path, backend: &str) -> Result<Self> {
-        let config = MossConfig::from_file(&model_dir.join("config.json"))?;
-        let weight_data = crate::weights::load_weights(model_dir)?;
+    /// Load with an explicit [`Backend`] selection tag.
+    ///
+    /// CUDA device open failures and GPU component load failures fall back to
+    /// CPU with warnings (historical behavior for both `Auto` and `Cuda`).
+    pub fn load_with(model_dir: &Path, backend: Backend) -> Result<Self> {
+        let config = MossConfig::from_file(&model_dir.join("config.json"))
+            .map_err(|e| AsrError::config(format!("config.json: {e}")))?;
+        let weight_data = crate::weights::load_weights(model_dir).map_err(AsrError::model_load)?;
         let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
-            .map_err(|e| anyhow!("tokenizer load failed: {}", e))?;
+            .map_err(|e| AsrError::model_load(anyhow!("tokenizer load failed: {}", e)))?;
 
         let mel = load_mel_extractor(N_FFT, HOP_LENGTH, config.audio_config.num_mel_bins);
         let pc = ProcessorConfig::default();
 
-        let encoder = CpuWhisperEncoder::load(&weight_data, "model.whisper_encoder", &config.audio_config)?;
+        let encoder = CpuWhisperEncoder::load(
+            &weight_data,
+            "model.whisper_encoder",
+            &config.audio_config,
+        )
+        .map_err(AsrError::model_load)?;
         let adaptor = CpuVqAdaptor::load(
-            &weight_data, "model.vq_adaptor",
+            &weight_data,
+            "model.vq_adaptor",
             config.text_config.hidden_size,
             config.text_config.rms_norm_eps as f32,
-        )?;
-        let decoder = CpuTextDecoder::load(&weight_data, "model.language_model", &config.text_config)?;
+        )
+        .map_err(AsrError::model_load)?;
+        let decoder = CpuTextDecoder::load(
+            &weight_data,
+            "model.language_model",
+            &config.text_config,
+        )
+        .map_err(AsrError::model_load)?;
 
         let tokens = build_special_tokens(&tokenizer, &config);
 
-        // GPU stack (optional): shared CudaState drives both encoder + decoder.
+        // GPU stack (optional): shared CudaState drives encoder + adaptor + decoder.
+        // Device open: Auto and Cuda both fall back to CPU on init failure.
+        // Component loads are sequential with early exit (no wasted VRAM on later stages).
         #[cfg(feature = "cuda")]
         let gpu = {
-            let want_cuda = matches!(backend, "cuda" | "auto");
-            if want_cuda {
-                match crate::cudarc_engine::CudaState::new(0) {
-                    Ok(state) => {
-                        let cuda = std::sync::Arc::new(state);
-                        let gpu_enc = match crate::gpu_whisper::GpuWhisperEncoder::load(cuda.clone(), &weight_data, "model.whisper_encoder", &config.audio_config) {
+            match backend {
+                Backend::Cpu => None,
+                Backend::Cuda | Backend::Auto => match backend.resolve() {
+                    crate::backend::ResolvedBackend::Cpu => None,
+                    crate::backend::ResolvedBackend::Cuda(cuda) => {
+                        // Keep CPU encoder/adaptor/decoder unshadowed for finish_cpu fallback.
+                        let gpu_enc = match crate::gpu_whisper::GpuWhisperEncoder::load(
+                            cuda.clone(),
+                            &weight_data,
+                            "model.whisper_encoder",
+                            &config.audio_config,
+                        ) {
                             Ok(e) => e,
-                            Err(e) => { log::warn!("GPU encoder load failed ({e}); using CPU"); return Self::finish_cpu(config, pc, tokenizer, mel, encoder, adaptor, decoder, weight_data, tokens); }
+                            Err(e) => {
+                                log::warn!("GPU encoder load failed ({e}); using CPU");
+                                return Self::finish_cpu(
+                                    config, pc, tokenizer, mel, encoder, adaptor, decoder, tokens,
+                                );
+                            }
                         };
-                        let gpu_dec = match crate::cudarc_engine::GpuTextDecoder::load_with(cuda.clone(), &weight_data, "model.language_model", &config.text_config) {
+                        let gpu_dec = match crate::cudarc_engine::GpuTextDecoder::load_with(
+                            cuda.clone(),
+                            &weight_data,
+                            "model.language_model",
+                            &config.text_config,
+                        ) {
                             Ok(d) => d,
-                            Err(e) => { log::warn!("GPU decoder load failed ({e}); using CPU"); return Self::finish_cpu(config, pc, tokenizer, mel, encoder, adaptor, decoder, weight_data, tokens); }
+                            Err(e) => {
+                                log::warn!("GPU decoder load failed ({e}); using CPU");
+                                return Self::finish_cpu(
+                                    config, pc, tokenizer, mel, encoder, adaptor, decoder, tokens,
+                                );
+                            }
                         };
-                        let gpu_adaptor = match crate::cudarc_engine::GpuVqAdaptor::load(
-                            cuda.clone(), &weight_data, "model.vq_adaptor",
-                            config.text_config.hidden_size, config.text_config.rms_norm_eps as f32,
+                        let gpu_ad = match crate::cudarc_engine::GpuVqAdaptor::load(
+                            cuda.clone(),
+                            &weight_data,
+                            "model.vq_adaptor",
+                            config.text_config.hidden_size,
+                            config.text_config.rms_norm_eps as f32,
                         ) {
                             Ok(a) => a,
-                            Err(e) => { log::warn!("GPU adaptor load failed ({e}); using CPU"); return Self::finish_cpu(config, pc, tokenizer, mel, encoder, adaptor, decoder, weight_data, tokens); }
+                            Err(e) => {
+                                log::warn!("GPU adaptor load failed ({e}); using CPU");
+                                return Self::finish_cpu(
+                                    config, pc, tokenizer, mel, encoder, adaptor, decoder, tokens,
+                                );
+                            }
                         };
-                        log::info!("GPU stack loaded: Whisper encoder + VQAdaptor + Qwen3 decoder (cuda backend)");
-                        Some(GpuStack { cuda, encoder: gpu_enc, adaptor: gpu_adaptor, decoder: gpu_dec })
+                        log::info!(
+                            "GPU stack loaded: Whisper encoder + VQAdaptor + Qwen3 decoder (cuda backend)"
+                        );
+                        Some(GpuStack {
+                            cuda,
+                            encoder: gpu_enc,
+                            adaptor: gpu_ad,
+                            decoder: gpu_dec,
+                        })
                     }
-                    Err(e) => { log::warn!("CUDA init failed ({e}); using CPU"); None }
-                }
-            } else { None }
+                },
+            }
         };
 
+        // When cuda feature is off, resolve still selects CPU (no GPU path).
+        #[cfg(not(feature = "cuda"))]
+        let _ = backend.resolve();
+
+        let _ = weight_data; // already loaded into encoder/adaptor/decoder(/gpu)
         Ok(Self {
             inner: Mutex::new(AsrInner {
-                config, pc, tokenizer, mel, encoder, adaptor, decoder,
+                config,
+                pc,
+                tokenizer,
+                mel,
+                encoder,
+                adaptor,
+                decoder,
                 #[cfg(feature = "cuda")]
                 gpu,
-                weights: weight_data, tokens,
+                tokens,
             }),
         })
     }
 
+    /// CPU-only stack used when GPU init or a GPU component load fails mid-way.
     #[cfg(feature = "cuda")]
-    fn finish_cpu(config: MossConfig, pc: ProcessorConfig, tokenizer: tokenizers::Tokenizer, mel: MelExtractor,
-                  encoder: CpuWhisperEncoder, adaptor: CpuVqAdaptor, decoder: CpuTextDecoder,
-                  weight_data: HashMap<String, RawTensor>, tokens: SpecialTokens) -> Result<Self> {
+    fn finish_cpu(
+        config: MossConfig,
+        pc: ProcessorConfig,
+        tokenizer: tokenizers::Tokenizer,
+        mel: MelExtractor,
+        encoder: CpuWhisperEncoder,
+        adaptor: CpuVqAdaptor,
+        decoder: CpuTextDecoder,
+        tokens: SpecialTokens,
+    ) -> Result<Self> {
         Ok(Self {
             inner: Mutex::new(AsrInner {
-                config, pc, tokenizer, mel, encoder, adaptor, decoder, gpu: None, weights: weight_data, tokens,
+                config,
+                pc,
+                tokenizer,
+                mel,
+                encoder,
+                adaptor,
+                decoder,
+                gpu: None,
+                tokens,
             }),
         })
     }
 
-    /// Full transcription. Returns decoded text.
-    pub fn transcribe(&self, audio_path: &str, prompt: &str, max_new_tokens: usize) -> Result<String> {
-        let samples = load_audio_wav(audio_path, MEL_SAMPLE_RATE).map_err(|e| match e {
-            AsrError::AudioDecode(inner) => inner,
-            other => anyhow!("{}", other),
-        })?;
+    /// String backend: `"auto" | "cpu" | "cuda" | "gpu"` (case-insensitive).
+    ///
+    /// Unknown tags return [`AsrError::InvalidBackend`]. Requesting CUDA on a
+    /// build without the `cuda` feature also errors (does **not** silently use CPU).
+    pub fn load_with_backend(model_dir: &Path, backend: &str) -> Result<Self> {
+        let backend = Backend::from_str(backend)?;
+        Self::load_with(model_dir, backend)
+    }
+
+    /// Full transcription from a filesystem path. Returns decoded text.
+    pub fn transcribe(
+        &self,
+        audio_path: impl AsRef<Path>,
+        prompt: &str,
+        max_new_tokens: usize,
+    ) -> Result<String> {
+        let samples = load_audio_wav(audio_path.as_ref(), MEL_SAMPLE_RATE)?;
         self.transcribe_samples(&samples, prompt, max_new_tokens)
     }
 
-    pub fn transcribe_samples(&self, samples: &[f32], prompt: &str, max_new_tokens: usize) -> Result<String> {
-        let inner = self.inner.lock().map_err(|_| anyhow!("mutex poisoned"))?;
-        inner.run(samples, prompt, max_new_tokens)
+    pub fn transcribe_samples(
+        &self,
+        samples: &[f32],
+        prompt: &str,
+        max_new_tokens: usize,
+    ) -> Result<String> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| AsrError::inference(anyhow!("mutex poisoned")))?;
+        inner
+            .run(samples, prompt, max_new_tokens)
+            .map_err(AsrError::inference)
     }
 }
+
+// Public contract: AsrInference is Send so callers may share it across threads
+// (internally serialized via Mutex). Compile-fails if a field loses Send.
+const _: () = {
+    fn _assert_send<T: Send>() {}
+    fn _check() {
+        _assert_send::<AsrInference>();
+    }
+};
 
 fn build_special_tokens(tok: &tokenizers::Tokenizer, config: &MossConfig) -> SpecialTokens {
     let conv_id = |s: &str| -> i64 {
@@ -208,14 +326,9 @@ fn build_special_tokens(tok: &tokenizers::Tokenizer, config: &MossConfig) -> Spe
 }
 
 impl AsrInner {
-    fn run(&self, samples: &[f32], prompt: &str, max_new_tokens: usize) -> Result<String> {
+    fn run(&self, samples: &[f32], prompt: &str, max_new_tokens: usize) -> AnyResult<String> {
         let bench = std::env::var("MOSS_BENCH").is_ok();
         let t_total = std::time::Instant::now();
-        let mut t_preproc = std::time::Duration::ZERO;
-        let mut t_encode = std::time::Duration::ZERO;
-        let mut t_prompt = std::time::Duration::ZERO;
-        let mut t_prefill = std::time::Duration::ZERO;
-        let mut t_decode = std::time::Duration::ZERO;
 
         // 1. preprocess: mel + chunking + token lengths
         let tt = std::time::Instant::now();
@@ -229,7 +342,7 @@ impl AsrInner {
         for (i, &ci) in chunk_mapping.iter().enumerate() {
             audio_token_counts[ci] += feature_lengths[i];
         }
-        t_preproc = tt.elapsed();
+        let t_preproc = tt.elapsed();
 
         // 2. Whisper encoder over each chunk → trim → concat per audio → cast → time_merge → adaptor
         let tt = std::time::Instant::now();
@@ -247,7 +360,7 @@ impl AsrInner {
         )?;
         #[cfg(feature = "cuda")]
         if let Some(gpu) = self.gpu.as_ref() { gpu.encoder.synchronize().ok(); }
-        t_encode = tt.elapsed();
+        let t_encode = tt.elapsed();
 
         // 3. Build prompt: chat template + audio span (with time markers)
         let tt = std::time::Instant::now();
@@ -282,7 +395,7 @@ impl AsrInner {
         }
         assert_eq!(ai, audio_embeds.len() / hidden, "audio embed count != audio_token positions");
         let hidden_states = CpuTensor::new(hs_data, vec![1, seq_len, hidden]);
-        t_prompt = tt.elapsed();
+        let t_prompt = tt.elapsed();
 
         // 5. RoPE tables
         let total_positions = seq_len + max_new_tokens;
@@ -297,24 +410,17 @@ impl AsrInner {
         // truncate generation if the model ever emits it mid-stream.
         let eos_ids: &[i64] = &[self.tokens.im_end];
         log::debug!("eos_ids im_end={} audio_pad={}", self.tokens.im_end, self.config.audio_token_id);
-        let mut generated: Vec<u32> = Vec::new();
-        let mut current_pos = seq_len;
 
         #[cfg(feature = "cuda")]
-        let (t_prefill_dur, t_decode_dur, gen_ids, cp) = if let Some(gpu) = self.gpu.as_ref() {
+        let (t_prefill, t_decode, generated, _current_pos) = if let Some(gpu) = self.gpu.as_ref() {
             self.generate_gpu(gpu, &hidden_states, &all_pos, seq_len, max_new_tokens, eos_ids)?
         } else {
             self.generate_cpu(&hidden_states, &cos_table, &sin_table, total_positions, seq_len, max_new_tokens, eos_ids)?
         };
         #[cfg(not(feature = "cuda"))]
-        let (t_prefill_dur, t_decode_dur, gen_ids, cp) = self.generate_cpu(
+        let (t_prefill, t_decode, generated, _current_pos) = self.generate_cpu(
             &hidden_states, &cos_table, &sin_table, total_positions, seq_len, max_new_tokens, eos_ids,
         )?;
-        generated = gen_ids;
-        current_pos = cp;
-        t_prefill = t_prefill_dur;
-        t_decode = t_decode_dur;
-        let _ = current_pos;
         log::debug!("generated last 8 ids: {:?}", generated.iter().rev().take(8).copied().collect::<Vec<_>>());
 
         // 7. Decode token ids → text
@@ -348,7 +454,7 @@ impl AsrInner {
         cos_table: &[f32], sin_table: &[f32],
         total_positions: usize, seq_len: usize, max_new_tokens: usize,
         eos_ids: &[i64],
-    ) -> Result<(std::time::Duration, std::time::Duration, Vec<u32>, usize)> {
+    ) -> AnyResult<(std::time::Duration, std::time::Duration, Vec<u32>, usize)> {
         let mut kv = CpuKvCache::new(
             self.config.text_config.num_hidden_layers, 1,
             self.config.text_config.num_key_value_heads, total_positions,
@@ -386,7 +492,7 @@ impl AsrInner {
         hidden_states: &CpuTensor,
         all_pos: &[i64],
         seq_len: usize, max_new_tokens: usize, eos_ids: &[i64],
-    ) -> Result<(std::time::Duration, std::time::Duration, Vec<u32>, usize)> {
+    ) -> AnyResult<(std::time::Duration, std::time::Duration, Vec<u32>, usize)> {
         use crate::cudarc_engine::{
             compute_rope_cos_sin_f16, CpuTensor as GpuCpuTensor, DecodeScratch, GpuKvCache,
         };
@@ -453,7 +559,7 @@ impl AsrInner {
         num_mel: usize,
         feature_lengths: &[usize],
         chunk_mapping: &[usize],
-    ) -> Result<Vec<f32>> {
+    ) -> AnyResult<Vec<f32>> {
         use crate::cudarc_engine::GpuTensor;
         use half::bf16;
         let gpu = self.gpu.as_ref().unwrap();
@@ -485,7 +591,6 @@ impl AsrInner {
                 cat_chunks.push(sliced);
             }
             // Concat along dim 1 → [1, cat_t, d_model]
-            let mut cat_data = cat_chunks[0].data.clone();
             let total_cat = cat_t * d_model;
             let mut full = unsafe { cuda.stream.alloc::<bf16>(total_cat)? };
             let mut offset = 0usize;
@@ -515,11 +620,11 @@ impl AsrInner {
     fn encode_audio(
         &self,
         input_features: &[f32],
-        n_chunks: usize,
+        _n_chunks: usize,
         num_mel: usize,
         feature_lengths: &[usize],
         chunk_mapping: &[usize],
-    ) -> Result<Vec<f32>> {
+    ) -> AnyResult<Vec<f32>> {
         let nb_frames = self.pc.nb_max_frames;
         let d_model = self.config.audio_config.d_model;
         let merge = self.pc.audio_merge_size;
@@ -576,13 +681,13 @@ impl AsrInner {
     ///   <|im_start|>system\nYou are a helpful assistant.<|im_end|>\n
     ///   <|im_start|>user\n<|audio_start|>{audio_span}<|audio_end|>\n{prompt}<|im_end|>\n
     ///   <|im_start|>assistant\n
-    fn build_prompt(&self, prompt: &str, audio_token_count: usize, nat: usize) -> Result<(Vec<i64>, usize)> {
+    fn build_prompt(&self, prompt: &str, audio_token_count: usize, nat: usize) -> AnyResult<(Vec<i64>, usize)> {
         let t = &self.tokens;
         // audio span (with time markers)
         let span = audio_span_ids(nat, t.audio_pad, &t.digits, &self.pc);
 
         // Encode text pieces via tokenizer (no special tokens for the literal text portions).
-        let enc = |s: &str| -> Result<Vec<i64>> {
+        let enc = |s: &str| -> AnyResult<Vec<i64>> {
             let e = self.tokenizer.encode(s, false).map_err(|x| anyhow!("encode: {}", x))?;
             Ok(e.get_ids().iter().map(|&id| id as i64).collect())
         };
@@ -632,6 +737,53 @@ fn dump_i64(path: std::path::PathBuf, data: &[i64]) {
     if let Ok(mut f) = std::fs::File::create(&path) {
         let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
         let _ = f.write_all(&bytes);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Backend;
+
+    #[test]
+    fn embedded_mel_filterbank_matches_data_file() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("data")
+            .join("whisper_mel_filters.bin");
+        let on_disk = std::fs::read(&path).expect("data/whisper_mel_filters.bin must exist");
+        assert_eq!(
+            EMBEDDED_MEL_FILTERS, on_disk.as_slice(),
+            "include_bytes! must match data/whisper_mel_filters.bin exactly"
+        );
+        // Whisper-Medium: 80 mels × (400/2+1)=201 bins × 4 bytes
+        assert_eq!(EMBEDDED_MEL_FILTERS.len(), 80 * 201 * 4);
+    }
+
+    #[test]
+    fn backend_from_str_roundtrip_tags() {
+        assert_eq!(Backend::from_str("cpu").unwrap().tag(), "cpu");
+        assert_eq!(Backend::from_str("auto").unwrap().tag(), "auto");
+        #[cfg(feature = "cuda")]
+        assert_eq!(Backend::from_str("cuda").unwrap().tag(), "cuda:0");
+    }
+
+    #[test]
+    fn public_load_missing_model_is_asr_error() {
+        match AsrInference::load(Path::new("/no/such/moss/model/dir")) {
+            Ok(_) => panic!("expected load failure for missing model dir"),
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("Model load")
+                        || msg.contains("No such")
+                        || msg.contains("os error")
+                        || msg.contains("failed")
+                        || msg.contains("cannot find")
+                        || msg.contains("系统找不到"),
+                    "unexpected error: {msg}"
+                );
+            }
+        }
     }
 }
 

@@ -1,11 +1,10 @@
 use std::path::PathBuf;
+use std::str::FromStr;
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
-use moss_transcribe_diarize_rs::AsrInference;
-
-mod transcript;
+use moss_transcribe_diarize_rs::{AsrError, AsrInference, Backend};
 
 #[derive(Parser, Debug)]
 #[command(name = "moss-transcribe-diarize-rs")]
@@ -26,12 +25,14 @@ struct TranscribeArgs {
     #[arg(value_name = "AUDIO")]
     audio: PathBuf,
 
-    #[arg(long, default_value = r"D:\MOSS-Transcribe-Diarize\pretrained\moss-transcribe-diarize")]
-    model: PathBuf,
+    /// Model directory (config.json + safetensors + tokenizer).
+    /// Defaults to `MOSS_MODEL_DIR` when set; otherwise required.
+    #[arg(long, env = "MOSS_MODEL_DIR")]
+    model: Option<PathBuf>,
 
-    /// Backend: auto | cpu | cuda (cpu is the Phase-1 alignment reference)
-    #[arg(long, default_value = "cpu")]
-    backend: String,
+    /// Compute backend: auto | cpu | cuda | gpu (historical CLI default: cpu).
+    #[arg(long, default_value = "cpu", value_parser = parse_backend)]
+    backend: Backend,
 
     #[arg(long, default_value_t = 2048)]
     max_new_tokens: usize,
@@ -41,18 +42,27 @@ struct TranscribeArgs {
     prompt: Option<String>,
 }
 
+fn parse_backend(s: &str) -> std::result::Result<Backend, String> {
+    Backend::from_str(s).map_err(|e: AsrError| e.to_string())
+}
+
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cli = Cli::parse();
     match cli.command {
         Commands::Transcribe(args) => {
-            let infer = AsrInference::load_with_backend(&args.model, &args.backend)?;
+            let model = args.model.ok_or_else(|| {
+                anyhow::anyhow!("model path required: pass --model PATH or set MOSS_MODEL_DIR")
+            })?;
+            if !model.is_dir() {
+                bail!("model path is not a directory: {}", model.display());
+            }
+            let infer = AsrInference::load_with(&model, args.backend)
+                .with_context(|| format!("load model from {}", model.display()))?;
             let prompt = args.prompt.unwrap_or_else(default_en_prompt);
-            let text = infer.transcribe(
-                args.audio.to_str().unwrap(),
-                &prompt,
-                args.max_new_tokens,
-            )?;
+            let text = infer
+                .transcribe(&args.audio, &prompt, args.max_new_tokens)
+                .with_context(|| format!("transcribe {}", args.audio.display()))?;
             println!("{}", text);
         }
     }

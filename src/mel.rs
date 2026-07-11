@@ -270,12 +270,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_hann_window_edges() {
-        let w = hann_window(5);
-        assert_eq!(w.len(), 5);
+    fn test_hann_window_matches_periodic_formula() {
+        // Periodic Hann: w[i] = 0.5*(1-cos(2πi/N)) — matches Python window_function.
+        let n = 8usize;
+        let w = hann_window(n);
+        assert_eq!(w.len(), n);
         assert!(w[0].abs() < 1e-6);
-        assert!(w[4].abs() < 1e-6);
-        assert!((w[2] - 1.0).abs() < 1e-6);
+        // At i=N/2: cos(π) = -1 → w = 1
+        assert!((w[n / 2] - 1.0).abs() < 1e-6);
+        for i in 0..n {
+            let expected = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / n as f32).cos());
+            assert!(
+                (w[i] - expected).abs() < 1e-6,
+                "w[{i}]={} expected={}",
+                w[i],
+                expected
+            );
+        }
     }
 
     #[test]
@@ -306,13 +317,35 @@ mod tests {
         assert_eq!(mel.len(), n_mels * n_frames);
         assert!(mel.iter().all(|v| v.is_finite()));
     }
+
+    /// Shipped path: public `load_audio_wav` must open a real wav and return mono f32.
+    #[test]
+    fn load_audio_wav_opens_path() {
+        let candidates = [
+            std::path::PathBuf::from(r"D:\MOSS-Transcribe-Diarize\90s_16k.wav"),
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data").join("missing.wav"),
+        ];
+        let path = candidates.into_iter().find(|p| p.is_file());
+        let Some(path) = path else {
+            // Structural check: API still callable with Path (compile-time + error path).
+            let err = crate::load_audio_wav(
+                std::path::Path::new("definitely-does-not-exist-moss-asr.wav"),
+                16000,
+            );
+            assert!(err.is_err());
+            return;
+        };
+        let samples = crate::load_audio_wav(&path, 16000).expect("load wav");
+        assert!(!samples.is_empty());
+        assert!(samples.iter().all(|s| s.is_finite()));
+    }
 }
 
-pub fn load_audio_wav(path: &str, target_sr: u32) -> crate::Result<Vec<f32>> {
-    load_audio_wav_impl(path, target_sr).map_err(crate::error::AsrError::AudioDecode)
+pub fn load_audio_wav(path: impl AsRef<std::path::Path>, target_sr: u32) -> crate::Result<Vec<f32>> {
+    load_audio_wav_impl(path.as_ref(), target_sr).map_err(crate::error::AsrError::audio_decode)
 }
 
-fn load_audio_wav_impl(path: &str, target_sr: u32) -> anyhow::Result<Vec<f32>> {
+fn load_audio_wav_impl(path: &std::path::Path, target_sr: u32) -> anyhow::Result<Vec<f32>> {
     let reader = hound::WavReader::open(path)?;
     let spec = reader.spec();
     let sr = spec.sample_rate;

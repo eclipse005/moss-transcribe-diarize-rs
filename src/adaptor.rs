@@ -71,7 +71,7 @@ impl CpuVqAdaptor {
                 Parallelism::Rayon(0),
             );
         }
-        h.par_chunks_mut(self.hidden).enumerate().for_each(|(i, row)| {
+        h.par_chunks_mut(self.hidden).for_each(|row| {
             for j in 0..self.hidden { row[j] += self.l0_b[j]; }
             // SiLU
             for j in 0..self.hidden {
@@ -92,7 +92,7 @@ impl CpuVqAdaptor {
                 Parallelism::Rayon(0),
             );
         }
-        h2.par_chunks_mut(self.hidden).enumerate().for_each(|(i, row)| {
+        h2.par_chunks_mut(self.hidden).for_each(|row| {
             for j in 0..self.hidden { row[j] += self.l2_b[j]; }
         });
 

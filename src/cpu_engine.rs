@@ -62,6 +62,7 @@ pub(crate) struct CpuWeightF16 {
 
 impl CpuWeightF16 {
     /// Sequential f16→f32. Better for many small calls (audio encoder: ~100/forward).
+    #[allow(dead_code)]
     pub(crate) fn to_f32(&self) -> CpuWeight {
         let data: Vec<f32> = self.data.iter().map(|v| v.to_f32()).collect();
         CpuWeight { data, rows: self.rows, cols: self.cols }
@@ -173,6 +174,7 @@ fn linear_accum_i8(out: &mut CpuTensor, x: &CpuTensor, w: &CpuWeightI8) {
 // element (i, j) is at i*n + j, so cs=1, rs=n.  Same for x.  W^T conceptually is [k, n] with
 // element (i, j) = W[j, i]; since W is row-major [n, k] (W[j, i] at j*k + i), B's cs = k, rs = 1.
 
+#[allow(dead_code)]
 pub(crate) fn linear(x: &CpuTensor, w: &CpuWeight) -> CpuTensor {
     let nd = x.shape.len();
     let m: usize = x.shape[..nd - 1].iter().product();
@@ -387,7 +389,7 @@ fn linear_gemv_i8(x: &[f32], w: &CpuWeightI8) -> Vec<f32> {
 // ═══════════════════════════════════════════════════════════════════════
 
 /// out[i, j] = x[i, j] * w[j] / sqrt(mean(x[i, :]^2) + eps)
-pub fn rms_norm(x: &CpuTensor, w: &[f32], eps: f32) -> CpuTensor {
+pub(crate) fn rms_norm(x: &CpuTensor, w: &[f32], eps: f32) -> CpuTensor {
     let nd = x.shape.len();
     let last = x.shape[nd - 1];
     let outer: usize = x.shape[..nd - 1].iter().product();
@@ -407,7 +409,7 @@ pub fn rms_norm(x: &CpuTensor, w: &[f32], eps: f32) -> CpuTensor {
 }
 
 /// out = silu(gate) * up where gu = [gate | up] along last dim.  gu: [outer, 2*inter] → out: [outer, inter].
-pub fn silu_mul_split(gu: &CpuTensor) -> CpuTensor {
+pub(crate) fn silu_mul_split(gu: &CpuTensor) -> CpuTensor {
     let nd = gu.shape.len();
     let two_inter = gu.shape[nd - 1];
     let inter = two_inter / 2;
@@ -429,7 +431,7 @@ pub fn silu_mul_split(gu: &CpuTensor) -> CpuTensor {
 }
 
 /// Embedding lookup from f16 table — converts each row to f32 on the fly.
-pub fn embed_lookup_f16(table: &CpuWeightF16, ids: &[i64]) -> CpuTensor {
+pub(crate) fn embed_lookup_f16(table: &CpuWeightF16, ids: &[i64]) -> CpuTensor {
     let n = ids.len();
     let d = table.cols;
     let mut out = vec![0.0f32; n * d];
@@ -495,7 +497,7 @@ fn apply_rotary_row(x: &mut [f32], cos: &[f32], sin: &[f32]) {
 //   q_out: [b, nqh, s, hd]   (norm+rotary applied)
 //   k_cache, v_cache: [b, nkvh, max_seq, hd]  at rows [start..start+s)
 //     - K: norm+rotary; V: raw copy
-pub fn qkv_extract_qkv_norm_rotary_cache(
+pub(crate) fn qkv_extract_qkv_norm_rotary_cache(
     qkv: &CpuTensor,
     qn_w: &[f32], kn_w: &[f32],
     cos_table: &[f32], sin_table: &[f32],
@@ -577,7 +579,7 @@ pub fn qkv_extract_qkv_norm_rotary_cache(
 //
 // One (b, qh) per rayon job: compute scores = q · K^T, softmax, out = attn · V.
 // Done in f32 throughout; cheap vs prefill because cur_len is small (decode-only).
-pub fn fused_gqa_decode(
+pub(crate) fn fused_gqa_decode(
     q: &CpuTensor,
     k_cache: &[f32], v_cache: &[f32],
     b: usize, nqh: usize, nkvh: usize, max_seq: usize, hd: usize, cur_len: usize,

@@ -15,7 +15,7 @@ use crate::config::WhisperAudioConfig;
 use crate::cudarc_engine::{CudaState, GpuTensor, GpuWeight};
 use crate::raw_tensor::RawTensor;
 
-pub struct GpuWhisperEncoder {
+pub(crate) struct GpuWhisperEncoder {
     cuda: Arc<CudaState>,
     conv1_w: CudaSlice<bf16>,   // [out_ch, in_ch, 3] flat
     conv1_b: CudaSlice<bf16>,
@@ -27,7 +27,6 @@ pub struct GpuWhisperEncoder {
     ln_b: CudaSlice<bf16>,
     d_model: usize,
     n_heads: usize,
-    ffn: usize,
     eps: f32,
 }
 
@@ -43,10 +42,9 @@ struct GpuWhisperLayerData {
 }
 
 impl GpuWhisperEncoder {
-    pub fn synchronize(&self) -> Result<()> { self.cuda.synchronize() }
+    pub(crate) fn synchronize(&self) -> Result<()> { self.cuda.synchronize() }
 
-    pub fn load(cuda: Arc<CudaState>, weights: &HashMap<String, RawTensor>, prefix: &str, cfg: &WhisperAudioConfig) -> Result<Self> {
-        let g = |name: &str| -> Result<GpuWeight> { crate::cudarc_engine::load_gpu_weight(&cuda, weights, name) };
+    pub(crate) fn load(cuda: Arc<CudaState>, weights: &HashMap<String, RawTensor>, prefix: &str, cfg: &WhisperAudioConfig) -> Result<Self> {
         let gv = |name: &str| -> Result<CudaSlice<bf16>> { crate::cudarc_engine::load_gpu_vec(&cuda, weights, name) };
         let p = |s: &str| format!("{}.{}", prefix, s);
         let mut layers = Vec::with_capacity(cfg.encoder_layers);
@@ -100,13 +98,13 @@ impl GpuWhisperEncoder {
             ln_b,
             d_model: cfg.d_model,
             n_heads: cfg.encoder_attention_heads,
-            ffn: cfg.encoder_ffn_dim,
             eps: 1e-5,
         })
     }
 
     /// mel: [1, num_mel, nb_max_frames] f32 host → uploaded. Returns host [1, T_out*d_model] f32.
-    pub fn forward_f32(&self, mel: &[f32], num_mel: usize, nb_frames: usize) -> Result<Vec<f32>> {
+    #[allow(dead_code)]
+    pub(crate) fn forward_f32(&self, mel: &[f32], num_mel: usize, nb_frames: usize) -> Result<Vec<f32>> {
         let h = self.forward_gpu(mel, num_mel, nb_frames)?;
         let host = self.cuda.download_tensor(&h)?;
         Ok(host.data.iter().map(|&v| v.to_f32()).collect())
@@ -114,7 +112,7 @@ impl GpuWhisperEncoder {
 
     /// mel: [1, num_mel, nb_max_frames] f32 host → uploaded. Returns GPU [1, T_out, d_model].
     /// Stays on device — avoids D2H when the downstream time_merge + adaptor also run on GPU.
-    pub fn forward_gpu(&self, mel: &[f32], num_mel: usize, nb_frames: usize) -> Result<GpuTensor> {
+    pub(crate) fn forward_gpu(&self, mel: &[f32], num_mel: usize, nb_frames: usize) -> Result<GpuTensor> {
         let b = 1usize;
         let mel_bf16: Vec<bf16> = mel.iter().map(|&v| bf16::from_f32(v)).collect();
         let mel_gpu = self.cuda.upload_f16(&mel_bf16)?;

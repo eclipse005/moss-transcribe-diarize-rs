@@ -6,6 +6,7 @@
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // fields deserialized for forward-compat with HF config.json
 pub struct MossConfig {
     pub text_config: Qwen3TextConfig,
     pub audio_config: WhisperAudioConfig,
@@ -36,6 +37,7 @@ impl MossConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct Qwen3TextConfig {
     #[serde(default = "default_vocab_size")]
     pub vocab_size: usize,
@@ -75,6 +77,7 @@ fn default_rope_theta() -> f64 { 1_000_000.0 }
 fn default_max_position_embeddings() -> usize { 131072 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct WhisperAudioConfig {
     #[serde(default = "default_num_mel_bins")]
     pub num_mel_bins: usize,
@@ -102,6 +105,7 @@ fn default_scale_embedding() -> bool { false }
 
 /// Processor constants (from processor_config.json + preprocessor_config.json).
 /// These are fixed for this model; kept here as a single source of truth.
+#[allow(dead_code)]
 pub struct ProcessorConfig {
     pub sampling_rate: u32,
     pub n_fft: usize,

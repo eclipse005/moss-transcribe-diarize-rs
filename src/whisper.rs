@@ -31,7 +31,8 @@ impl CpuEncTensor {
         assert_eq!(data.len(), expected);
         Self { data, shape }
     }
-    pub fn numel(&self) -> usize { self.data.len() }
+    #[allow(dead_code)]
+    pub(crate) fn numel(&self) -> usize { self.data.len() }
 }
 
 // ─── Whisper conv1d (kernel=3, stride=2, padding=1) ───────────────────
@@ -301,7 +302,7 @@ impl CpuWhisperLayer {
 
 // ─── Full encoder ─────────────────────────────────────────────────────
 
-pub struct CpuWhisperEncoder {
+pub(crate) struct CpuWhisperEncoder {
     conv1_w: Vec<f32>, conv1_b: Vec<f32>,   // [d_model, num_mel, 1]
     conv2_w: Vec<f32>, conv2_b: Vec<f32>,   // [d_model, d_model, 1]
     embed_positions: Vec<f32>,              // [max_source_positions, d_model]
@@ -310,12 +311,11 @@ pub struct CpuWhisperEncoder {
     d_model: usize,
     n_heads: usize,
     ffn: usize,
-    n_layers: usize,
     eps: f32,
 }
 
 impl CpuWhisperEncoder {
-    pub fn load(weights: &HashMap<String, RawTensor>, prefix: &str, cfg: &WhisperAudioConfig) -> Result<Self> {
+    pub(crate) fn load(weights: &HashMap<String, RawTensor>, prefix: &str, cfg: &WhisperAudioConfig) -> Result<Self> {
         let g = |name: &str| -> Result<Vec<f32>> {
             Ok(weights.get(name).ok_or_else(|| anyhow::anyhow!("missing {}", name))?.to_f32_vec()?)
         };
@@ -336,13 +336,12 @@ impl CpuWhisperEncoder {
             d_model: cfg.d_model,
             n_heads: cfg.encoder_attention_heads,
             ffn: cfg.encoder_ffn_dim,
-            n_layers: cfg.encoder_layers,
             eps: 1e-5, // Whisper uses default LayerNorm eps 1e-5
         })
     }
 
     /// mel: [1, num_mel, nb_max_frames] (f32). Returns [1, T_out, d_model].
-    pub fn forward(&self, mel: &CpuEncTensor) -> CpuEncTensor {
+    pub(crate) fn forward(&self, mel: &CpuEncTensor) -> CpuEncTensor {
         // conv1 (k=3, s=1, p=1) + GELU, conv2 (k=3, s=2, p=1) + GELU.
         let num_mel = mel.shape[1];
         let mut x = conv1d_k3(mel, &self.conv1_w, &self.conv1_b, num_mel, self.d_model, 1);

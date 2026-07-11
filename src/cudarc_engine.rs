@@ -117,8 +117,15 @@ pub(crate) struct CudaState {
     pub k: CudaKernels,
 }
 
-unsafe impl Send for CudaState {}
-unsafe impl Sync for CudaState {}
+// CudaState must be Send+Sync so it can live in Arc across the inference API.
+// Auto-traits come from cudarc fields (no unsafe impl). Compile-time asserts below.
+
+const _: () = {
+    fn _assert_send_sync<T: Send + Sync>() {}
+    fn _check() {
+        _assert_send_sync::<CudaState>();
+    }
+};
 
 impl CudaState {
     pub fn new(ordinal: usize) -> Result<Self> {
@@ -198,7 +205,8 @@ impl CudaState {
     pub fn upload_f16(&self, data: &[bf16]) -> Result<CudaSlice<bf16>> {
         Ok(self.stream.clone_htod(data)?)
     }
-    pub fn upload_i64(&self, data: &[i64]) -> Result<CudaSlice<i64>> {
+    #[allow(dead_code)]
+    pub(crate) fn upload_i64(&self, data: &[i64]) -> Result<CudaSlice<i64>> {
         Ok(self.stream.clone_htod(data)?)
     }
     pub fn alloc_zeros_f16(&self, n: usize) -> Result<CudaSlice<bf16>> {
@@ -1340,7 +1348,8 @@ impl CudaState {
 
     /// fused_gqa_decode_split writing into pre-allocated partial + output buffers.
     /// `max_chunks` is the fixed grid y-dimension (upper bound for graph stability).
-    pub fn fused_gqa_decode_split_into(&self, q: &CudaSlice<bf16>,
+    #[allow(dead_code)]
+    pub(crate) fn fused_gqa_decode_split_into(&self, q: &CudaSlice<bf16>,
         k_cache: &CudaSlice<bf16>, v_cache: &CudaSlice<bf16>,
         nkvh: usize, max_seq: usize, cur_len: usize, scale: f32, chunk_size: usize, max_chunks: usize,
         part_out: &mut CudaSlice<f32>, part_max: &mut CudaSlice<f32>, part_sum: &mut CudaSlice<f32>,
@@ -1613,7 +1622,8 @@ impl GpuTextDecoder {
         Ok(Self { embed_table, layers, norm_w, eps: config.rms_norm_eps as f32, config: config.clone(), cuda })
     }
 
-    pub fn embed_ids(&self, ids: &[i64]) -> Result<GpuTensor> {
+    #[allow(dead_code)]
+    pub(crate) fn embed_ids(&self, ids: &[i64]) -> Result<GpuTensor> {
         let ids_gpu = self.cuda.upload_i64(ids)?;
         self.cuda.embed_lookup(&self.embed_table, &ids_gpu)
     }
@@ -1710,13 +1720,12 @@ pub(crate) struct GpuVqAdaptor {
     l0_w: GpuWeight, l0_b: CudaSlice<bf16>,   // Linear(input_dim → hidden)
     l2_w: GpuWeight, l2_b: CudaSlice<bf16>,   // Linear(hidden → hidden)
     ln_w: CudaSlice<bf16>, ln_b: CudaSlice<bf16>, // LayerNorm(hidden)
-    hidden: usize,
     eps: f32,
 }
 
 impl GpuVqAdaptor {
-    pub fn load(cuda: Arc<CudaState>, weights: &HashMap<String, RawTensor>, prefix: &str,
-                hidden: usize, eps: f32) -> Result<Self> {
+    pub(crate) fn load(cuda: Arc<CudaState>, weights: &HashMap<String, RawTensor>, prefix: &str,
+                _hidden: usize, eps: f32) -> Result<Self> {
         let g = |name: &str| -> Result<GpuWeight> { load_gpu_weight(&cuda, weights, name) };
         let gv = |name: &str| -> Result<CudaSlice<bf16>> { load_gpu_vec(&cuda, weights, name) };
         let p = |s: &str| format!("{}.{}", prefix, s);
@@ -1727,7 +1736,6 @@ impl GpuVqAdaptor {
             l2_b: gv(&p("layers.2.bias"))?,
             ln_w: gv(&p("layers.3.weight"))?,
             ln_b: gv(&p("layers.3.bias"))?,
-            hidden,
             eps,
         })
     }
