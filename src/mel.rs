@@ -1,4 +1,5 @@
 use anyhow::Result;
+use rayon::prelude::*;
 use rustfft::{num_complex::Complex, FftPlanner};
 
 pub(crate) const MEL_SAMPLE_RATE: u32 = 16000;
@@ -48,23 +49,39 @@ fn compute_power_stft(
     // internally. f32 FFT accumulates enough twiddle-factor error to diverge
     // in the power spectrum (max-abs ~0.8 in the resulting mel), which then
     // shifts rare timestamp tokens vs the Python reference.
+    //
+    // The FFT plan is Sync (read-only after creation), so frames are computed
+    // in parallel via rayon — each thread gets its own scratch frame buffer.
     let mut planner = FftPlanner::<f64>::new();
     let fft = planner.plan_fft_forward(n_fft);
-
-    let mut power = vec![0.0f32; n_freqs * n_frames];
-    let mut frame_buf = vec![Complex::new(0.0f64, 0.0f64); n_fft];
     let window_f64: Vec<f64> = window.iter().map(|&v| v as f64).collect();
 
-    for i in 0..n_frames {
-        let start = i * hop_length;
-        for j in 0..n_fft {
-            frame_buf[j] = Complex::new(signal[start + j] as f64 * window_f64[j], 0.0);
-        }
-        fft.process(&mut frame_buf);
+    // power is column-major [n_freqs, n_frames]. We compute per-frame into a
+    // temporary row-major buffer, then scatter into the column-major layout.
+    // Parallelize across frames (each thread gets its own frame_buf).
+    let frame_results: Vec<Vec<f32>> = (0..n_frames)
+        .into_par_iter()
+        .map(|i| {
+            let start = i * hop_length;
+            let mut frame_buf = vec![Complex::new(0.0f64, 0.0f64); n_fft];
+            for j in 0..n_fft {
+                frame_buf[j] = Complex::new(signal[start + j] as f64 * window_f64[j], 0.0);
+            }
+            fft.process(&mut frame_buf);
+            let mut row = vec![0.0f32; n_freqs];
+            for k in 0..n_freqs {
+                let re = frame_buf[k].re;
+                let im = frame_buf[k].im;
+                row[k] = (re * re + im * im) as f32;
+            }
+            row
+        })
+        .collect();
+
+    let mut power = vec![0.0f32; n_freqs * n_frames];
+    for (i, row) in frame_results.iter().enumerate() {
         for k in 0..n_freqs {
-            let re = frame_buf[k].re;
-            let im = frame_buf[k].im;
-            power[k * n_frames + i] = (re * re + im * im) as f32;
+            power[k * n_frames + i] = row[k];
         }
     }
 

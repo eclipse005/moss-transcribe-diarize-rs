@@ -160,28 +160,44 @@ fn attention(x: &CpuEncTensor, q_w: &[f32], q_b: &[f32],
     let q = linear(x, q_w, Some(q_b), d_model);
     let k = linear(x, k_w, Some(k_b), d_model);
     let v = linear(x, v_w, Some(v_b), d_model);
-    // q,k,v: [b, s, d_model]
+    // q,k,v: [b, s, d_model] — layout is [b, s, n_heads, head_dim] interleaved
 
     // scores per (b, head): [s, s] = q_head @ k_head^T * scale → softmax → @ v_head
     let out = vec![0.0f32; b * s * d_model];
     // SAFETY: each (b, head) writes disjoint head_dim slices of `out`. The raw
     // pointer is derived inside the closure (not captured) so the closure stays Send.
+    //
+    // QK^T and AV use the gemm crate (tiled AVX2-FMA microkernels) instead of
+    // hand-written scalar triple loops — the same proven pattern as the decoder's
+    // prefill_attention. The q/k/v head slices are contiguous (head_dim f32 each)
+    // and the per-token stride within q/k/v is d_model, so gemm gets efficient
+    // row-major access on K^T and V.
     (0..b * n_heads).into_par_iter().for_each(|idx| {
         let ib = idx / n_heads;
         let h = idx % n_heads;
         let off = h * head_dim;
-        // gather q/k/v head rows for this batch
+
+        // --- QK^T: scores[s, s] = q_head[s,hd] @ k_head^T[hd,s] ---
+        // q/k/v are laid out as [b, s, d_model] with heads interleaved, so token i's
+        // head-h slice is at [i*d_model + h*head_dim .. .. + head_dim].
+        // For gemm: C[i,j] = sum_k A[i,k] * B[k,j], we need B[k,j] = k[j,k].
+        // A = q: lhs_cs=1 (contiguous head_dim), lhs_rs=d_model (token stride)
+        // B^T = K^T: rhs_cs=d_model (advance j→j+1), rhs_rs=1 (advance k→k+1)
         let mut scores = vec![0.0f32; s * s];
-        for i in 0..s {
-            let q_row = &q.data[(ib * s + i) * d_model + off..(ib * s + i) * d_model + off + head_dim];
-            for j in 0..s {
-                let k_row = &k.data[(ib * s + j) * d_model + off..(ib * s + j) * d_model + off + head_dim];
-                let mut dot = 0.0f32;
-                for d in 0..head_dim { dot += q_row[d] * k_row[d]; }
-                scores[i * s + j] = dot * scale;
-            }
+        unsafe {
+            let q_ptr = q.data.as_ptr().add((ib * s) * d_model + off);
+            let k_ptr = k.data.as_ptr().add((ib * s) * d_model + off);
+            gemm(
+                s, s, head_dim,
+                scores.as_mut_ptr(), 1, s as isize, false,
+                q_ptr, 1, d_model as isize,
+                k_ptr, d_model as isize, 1,
+                0.0, scale, false, false, false,
+                Parallelism::None,
+            );
         }
-        // softmax per row
+
+        // softmax per row (bidirectional — no mask)
         for i in 0..s {
             let row = &mut scores[i * s..(i + 1) * s];
             let mut mx = f32::NEG_INFINITY;
@@ -191,20 +207,20 @@ fn attention(x: &CpuEncTensor, q_w: &[f32], q_b: &[f32],
             let inv = 1.0 / sum;
             for v in row.iter_mut() { *v *= inv; }
         }
-        // out[i, off..off+head_dim] = sum_j scores[i,j] * v[j, off..]
+
+        // --- AV: out_head[s, hd] = scores[s,s] @ v_head[s,hd] ---
         unsafe {
             let out_ptr = out.as_ptr() as *mut f32;
-            for i in 0..s {
-                let mut acc = vec![0.0f32; head_dim];
-                for j in 0..s {
-                    let w = scores[i * s + j];
-                    let v_row = &v.data[(ib * s + j) * d_model + off..(ib * s + j) * d_model + off + head_dim];
-                    for d in 0..head_dim { acc[d] += w * v_row[d]; }
-                }
-                let dst = std::slice::from_raw_parts_mut(
-                    out_ptr.add((ib * s + i) * d_model + off), head_dim);
-                dst.copy_from_slice(&acc);
-            }
+            let dst = out_ptr.add((ib * s) * d_model + off);
+            let v_ptr = v.data.as_ptr().add((ib * s) * d_model + off);
+            gemm(
+                s, head_dim, s,
+                dst, 1, d_model as isize, false,
+                scores.as_ptr(), 1, s as isize,
+                v_ptr, 1, d_model as isize,      // V strided: rhs_cs=1, rhs_rs=d_model
+                0.0, 1.0, false, false, false,
+                Parallelism::None,
+            );
         }
     });
 
