@@ -40,7 +40,7 @@ fn cpu_transcribes_15s_like_python() {
     }
     let infer = moss_transcribe_diarize_rs::AsrInference::load(&model).expect("load");
     let text = infer
-        .transcribe(&audio, "Transcribe the audio as text.", 512)
+        .transcribe(&audio, "Transcribe the audio as text.", 512, None)
         .expect("transcribe");
     assert!(
         text.to_lowercase().contains("whippers") && text.to_lowercase().contains("crash course"),
@@ -64,7 +64,7 @@ fn cpu_and_cuda_agree_on_15s() {
     )
     .unwrap();
     let cpu_text = cpu
-        .transcribe(&audio, "Transcribe the audio as text.", 512)
+        .transcribe(&audio, "Transcribe the audio as text.", 512, None)
         .unwrap();
     #[cfg(feature = "cuda")]
     {
@@ -74,7 +74,7 @@ fn cpu_and_cuda_agree_on_15s() {
         )
         .unwrap();
         let cuda_text = cuda
-            .transcribe(&audio, "Transcribe the audio as text.", 512)
+            .transcribe(&audio, "Transcribe the audio as text.", 512, None)
             .unwrap();
         println!("CPU:  {cpu_text}");
         println!("CUDA: {cuda_text}");

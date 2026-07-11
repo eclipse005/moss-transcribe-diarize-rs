@@ -259,31 +259,63 @@ impl AsrInference {
         Self::load_with(model_dir, backend)
     }
 
-    /// Full transcription from a filesystem path. Returns decoded text.
+    /// Transcribe a WAV path. Returns the full raw transcript (same format as streamed deltas).
+    ///
+    /// `on_delta`: if `Some`, called with **newly decoded text** as tokens are generated
+    /// (no extra newlines; concatenating all deltas equals the returned string before trim).
+    /// Pass `None` for non-streaming (no intermediate decode — cheapest).
     pub fn transcribe(
         &self,
         audio_path: impl AsRef<Path>,
         prompt: &str,
         max_new_tokens: usize,
+        on_delta: Option<&mut dyn FnMut(&str)>,
     ) -> Result<String> {
         let samples = load_audio_wav(audio_path.as_ref(), MEL_SAMPLE_RATE)?;
-        self.transcribe_samples(&samples, prompt, max_new_tokens)
+        self.transcribe_samples(&samples, prompt, max_new_tokens, on_delta)
     }
 
+    /// Same as [`Self::transcribe`] but takes mono PCM samples already at 16 kHz (or any rate
+    /// already resampled by the caller). Prefer [`Self::transcribe`] for files.
     pub fn transcribe_samples(
         &self,
         samples: &[f32],
         prompt: &str,
         max_new_tokens: usize,
+        on_delta: Option<&mut dyn FnMut(&str)>,
     ) -> Result<String> {
         let inner = self
             .inner
             .lock()
             .map_err(|_| AsrError::inference(anyhow!("mutex poisoned")))?;
         inner
-            .run(samples, prompt, max_new_tokens)
+            .run(samples, prompt, max_new_tokens, on_delta)
             .map_err(AsrError::inference)
     }
+}
+
+/// Decode `generated` and invoke `on_delta` with the suffix past `prev_text`.
+/// Keeps stream text identical to a final full decode (same `skip_special_tokens=true`).
+fn push_stream_delta(
+    tokenizer: &tokenizers::Tokenizer,
+    generated: &[u32],
+    prev_text: &mut String,
+    on_delta: &mut dyn FnMut(&str),
+) -> AnyResult<()> {
+    let full = tokenizer
+        .decode(generated, true)
+        .map_err(|e| anyhow!("decode: {}", e))?;
+    if let Some(delta) = full.strip_prefix(prev_text.as_str()) {
+        if !delta.is_empty() {
+            on_delta(delta);
+        }
+        *prev_text = full;
+    } else if full != *prev_text {
+        // Rare: decode is not a pure prefix extension (special-token skipping edge).
+        // Emit nothing extra; resync so later deltas stay consistent.
+        *prev_text = full;
+    }
+    Ok(())
 }
 
 // Public contract: AsrInference is Send so callers may share it across threads
@@ -326,7 +358,13 @@ fn build_special_tokens(tok: &tokenizers::Tokenizer, config: &MossConfig) -> Spe
 }
 
 impl AsrInner {
-    fn run(&self, samples: &[f32], prompt: &str, max_new_tokens: usize) -> AnyResult<String> {
+    fn run(
+        &self,
+        samples: &[f32],
+        prompt: &str,
+        max_new_tokens: usize,
+        on_delta: Option<&mut dyn FnMut(&str)>,
+    ) -> AnyResult<String> {
         let bench = std::env::var("MOSS_BENCH").is_ok();
         let t_total = std::time::Instant::now();
 
@@ -413,17 +451,23 @@ impl AsrInner {
 
         #[cfg(feature = "cuda")]
         let (t_prefill, t_decode, generated, _current_pos) = if let Some(gpu) = self.gpu.as_ref() {
-            self.generate_gpu(gpu, &hidden_states, &all_pos, seq_len, max_new_tokens, eos_ids)?
+            self.generate_gpu(
+                gpu, &hidden_states, &all_pos, seq_len, max_new_tokens, eos_ids, on_delta,
+            )?
         } else {
-            self.generate_cpu(&hidden_states, &cos_table, &sin_table, total_positions, seq_len, max_new_tokens, eos_ids)?
+            self.generate_cpu(
+                &hidden_states, &cos_table, &sin_table, total_positions, seq_len, max_new_tokens,
+                eos_ids, on_delta,
+            )?
         };
         #[cfg(not(feature = "cuda"))]
         let (t_prefill, t_decode, generated, _current_pos) = self.generate_cpu(
-            &hidden_states, &cos_table, &sin_table, total_positions, seq_len, max_new_tokens, eos_ids,
+            &hidden_states, &cos_table, &sin_table, total_positions, seq_len, max_new_tokens,
+            eos_ids, on_delta,
         )?;
         log::debug!("generated last 8 ids: {:?}", generated.iter().rev().take(8).copied().collect::<Vec<_>>());
 
-        // 7. Decode token ids → text
+        // 7. Final decode (same options as stream path). Stream deltas already used this.
         let text = self.tokenizer.decode(&generated, true)
             .map_err(|e| anyhow!("decode: {}", e))?;
         if bench {
@@ -454,6 +498,7 @@ impl AsrInner {
         cos_table: &[f32], sin_table: &[f32],
         total_positions: usize, seq_len: usize, max_new_tokens: usize,
         eos_ids: &[i64],
+        mut on_delta: Option<&mut dyn FnMut(&str)>,
     ) -> AnyResult<(std::time::Duration, std::time::Duration, Vec<u32>, usize)> {
         let mut kv = CpuKvCache::new(
             self.config.text_config.num_hidden_layers, 1,
@@ -470,10 +515,14 @@ impl AsrInner {
         let hidden = self.config.text_config.hidden_size;
         let mut generated: Vec<u32> = Vec::new();
         let mut current_pos = seq_len;
+        let mut prev_text = String::new();
         let td = std::time::Instant::now();
         for _ in 0..max_new_tokens {
             if eos_ids.contains(&next_token) { break; }
             generated.push(next_token as u32);
+            if let Some(cb) = on_delta.as_deref_mut() {
+                push_stream_delta(&self.tokenizer, &generated, &mut prev_text, cb)?;
+            }
             let ne = self.decoder.embed_ids(&[next_token]);
             let ne = CpuTensor::new(ne.data, vec![1, 1, hidden]);
             let sl = self.decoder.forward(ne, cos_table, sin_table, &mut kv, current_pos, true, true);
@@ -492,6 +541,7 @@ impl AsrInner {
         hidden_states: &CpuTensor,
         all_pos: &[i64],
         seq_len: usize, max_new_tokens: usize, eos_ids: &[i64],
+        mut on_delta: Option<&mut dyn FnMut(&str)>,
     ) -> AnyResult<(std::time::Duration, std::time::Duration, Vec<u32>, usize)> {
         use crate::cudarc_engine::{
             compute_rope_cos_sin_f16, CpuTensor as GpuCpuTensor, DecodeScratch, GpuKvCache,
@@ -534,9 +584,13 @@ impl AsrInner {
         let td = std::time::Instant::now();
         let mut generated: Vec<u32> = Vec::new();
         let mut current_pos = seq_len;
+        let mut prev_text = String::new();
         loop {
             if eos_ids.contains(&next_token) { break; }
             generated.push(next_token as u32);
+            if let Some(cb) = on_delta.as_deref_mut() {
+                push_stream_delta(&self.tokenizer, &generated, &mut prev_text, cb)?;
+            }
             if generated.len() >= max_new_tokens { break; }
             // embed next token (read id from token_buf on device) → h_buf
             cuda.embed_id_from_gpu_slot_into(&decoder.embed_table, &token_buf, 0, &mut h_buf)?;

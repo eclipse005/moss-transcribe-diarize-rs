@@ -41,6 +41,9 @@ cargo run --release -- transcribe audio.wav --model "$MOSS_MODEL_DIR" --prompt "
 
 # 性能分析
 MOSS_BENCH=1 cargo run --release -- transcribe audio.wav --model "$MOSS_MODEL_DIR" --backend cuda
+
+# 流式输出（正文格式与非流式相同，字节边生成边刷到 stdout）
+cargo run --release -- transcribe audio.wav --model "$MOSS_MODEL_DIR" --backend cuda --stream
 ```
 
 ### 作为库
@@ -49,8 +52,16 @@ MOSS_BENCH=1 cargo run --release -- transcribe audio.wav --model "$MOSS_MODEL_DI
 use moss_transcribe_diarize_rs::{AsrInference, Backend};
 
 let infer = AsrInference::load_with(std::path::Path::new("path/to/model"), Backend::Cuda)?;
-let text = infer.transcribe("audio.wav", &prompt, 2048)?;
-println!("{}", text);
+
+// 非流式（无中间 decode，最快）
+let text = infer.transcribe("audio.wav", &prompt, 2048, None)?;
+
+// 流式：on_delta 收到新增文本片段；拼接结果与返回值一致（trim 前）
+let mut on_delta = |delta: &str| {
+    print!("{delta}"); // 或发到 UI
+};
+let text = infer.transcribe("audio.wav", &prompt, 2048, Some(&mut on_delta))?;
+println!("{text}");
 ```
 
 输出格式（紧凑时间戳）：
