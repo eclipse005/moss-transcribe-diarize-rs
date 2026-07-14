@@ -3,7 +3,7 @@ name = "moss-transcribe-diarize-rs"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Rust + hand-written CUDA inference port of MOSS-Transcribe-Diarize (Whisper + Qwen3 ASR)"
+description = "Rust + hand-written CUDA inference port of MOSS-Transcribe-Diarize (Whisper encoder + Qwen3-0.6B decoder)"
 license = "MIT"
 
 [dependencies]
