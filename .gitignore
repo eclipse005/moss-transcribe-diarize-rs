@@ -16,3 +16,7 @@
 *.log
 _dump_16k/
 _power_dump/
+
+# Local-only (not published)
+/tests
+/scripts
