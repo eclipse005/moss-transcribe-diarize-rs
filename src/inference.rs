@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use crate::adaptor::{time_merge, CpuVqAdaptor};
 use crate::backend::Backend;
 use crate::config::{MossConfig, ProcessorConfig};
-use crate::cpu_engine::{self, CpuKvCache, CpuTensor, CpuTextDecoder};
+use crate::cpu_engine::{self, CpuKvCache, CpuTensor, CpuTextDecoder, CpuWeightF16};
 use crate::error::{AsrError, Result};
 use crate::mel::{load_audio_wav, MelExtractor, MEL_SAMPLE_RATE, N_FFT, HOP_LENGTH};
 use crate::processor::{audio_span_ids, audios_to_input_features};
@@ -71,12 +71,25 @@ struct AsrInner {
     pc: ProcessorConfig,
     tokenizer: tokenizers::Tokenizer,
     mel: MelExtractor,
-    encoder: CpuWhisperEncoder,
-    adaptor: CpuVqAdaptor,
-    decoder: CpuTextDecoder,
-    #[cfg(feature = "cuda")]
-    gpu: Option<GpuStack>,
     tokens: SpecialTokens,
+    /// Exactly one compute stack is loaded — never both CPU and GPU full weights.
+    compute: ComputeStack,
+}
+
+/// Active inference stack. CUDA success path keeps only a host f16 embed table
+/// (for prompt scatter, bit-identical to the old dual-load path) plus GPU weights.
+enum ComputeStack {
+    Cpu {
+        encoder: CpuWhisperEncoder,
+        adaptor: CpuVqAdaptor,
+        decoder: CpuTextDecoder,
+    },
+    #[cfg(feature = "cuda")]
+    Gpu {
+        stack: GpuStack,
+        /// Same f16 conversion as `CpuTextDecoder::load` embed path.
+        embed_table: CpuWeightF16,
+    },
 }
 
 /// GPU-resident encoder + decoder sharing one CudaState.
@@ -102,151 +115,176 @@ impl AsrInference {
     ///
     /// CUDA device open failures and GPU component load failures fall back to
     /// CPU with warnings (historical behavior for both `Auto` and `Cuda`).
+    ///
+    /// **Load policy:** only one full weight stack is materialised.
+    /// - CPU / CUDA-init-fail → full CPU stack only
+    /// - CUDA success → GPU stack + host f16 embed table (prompt scatter); no CPU encoder/adaptor/layers
     pub fn load_with(model_dir: &Path, backend: Backend) -> Result<Self> {
+        let t_total = std::time::Instant::now();
+
+        let t = std::time::Instant::now();
         let config = MossConfig::from_file(&model_dir.join("config.json"))
             .map_err(|e| AsrError::config(format!("config.json: {e}")))?;
+        let ms_config = t.elapsed().as_secs_f64() * 1000.0;
+
+        let t = std::time::Instant::now();
         let weight_data = crate::weights::load_weights(model_dir).map_err(AsrError::model_load)?;
+        let ms_weights = t.elapsed().as_secs_f64() * 1000.0;
+
+        let t = std::time::Instant::now();
         let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
             .map_err(|e| AsrError::model_load(anyhow!("tokenizer load failed: {}", e)))?;
+        let ms_tokenizer = t.elapsed().as_secs_f64() * 1000.0;
 
         let mel = load_mel_extractor(N_FFT, HOP_LENGTH, config.audio_config.num_mel_bins);
         let pc = ProcessorConfig::default();
+        let tokens = build_special_tokens(&tokenizer, &config);
 
+        // Resolve first so we never pay for a stack we will not use.
+        let resolved = backend.resolve();
+        let (compute, ms_stack, stack_tag) = match resolved {
+            crate::backend::ResolvedBackend::Cpu => {
+                let t = std::time::Instant::now();
+                let compute = Self::load_cpu_stack(&weight_data, &config)?;
+                (compute, t.elapsed().as_secs_f64() * 1000.0, "cpu")
+            }
+            #[cfg(feature = "cuda")]
+            crate::backend::ResolvedBackend::Cuda(cuda) => {
+                let t = std::time::Instant::now();
+                match Self::try_load_gpu_stack(cuda, &weight_data, &config) {
+                    Ok(compute) => (compute, t.elapsed().as_secs_f64() * 1000.0, "cuda"),
+                    Err(e) => {
+                        log::warn!("GPU stack load failed ({e}); falling back to CPU");
+                        let t_cpu = std::time::Instant::now();
+                        let compute = Self::load_cpu_stack(&weight_data, &config)?;
+                        let ms = t.elapsed().as_secs_f64() * 1000.0
+                            + t_cpu.elapsed().as_secs_f64() * 1000.0;
+                        (compute, ms, "cpu-fallback")
+                    }
+                }
+            }
+        };
+
+        // Release mmap as soon as weights are materialised into the active stack.
+        drop(weight_data);
+
+        log::info!(
+            "model load: total={:.0}ms (config={:.0}ms weights={:.0}ms tokenizer={:.0}ms stack={:.0}ms [{stack_tag}])",
+            t_total.elapsed().as_secs_f64() * 1000.0,
+            ms_config,
+            ms_weights,
+            ms_tokenizer,
+            ms_stack,
+        );
+
+        Ok(Self {
+            inner: Mutex::new(AsrInner {
+                config,
+                pc,
+                tokenizer,
+                mel,
+                tokens,
+                compute,
+            }),
+        })
+    }
+
+    fn load_cpu_stack(
+        weight_data: &std::collections::HashMap<String, crate::raw_tensor::RawTensor>,
+        config: &MossConfig,
+    ) -> Result<ComputeStack> {
+        let t = std::time::Instant::now();
         let encoder = CpuWhisperEncoder::load(
-            &weight_data,
+            weight_data,
             "model.whisper_encoder",
             &config.audio_config,
         )
         .map_err(AsrError::model_load)?;
+        let ms_enc = t.elapsed().as_secs_f64() * 1000.0;
+
+        let t = std::time::Instant::now();
         let adaptor = CpuVqAdaptor::load(
-            &weight_data,
+            weight_data,
             "model.vq_adaptor",
             config.text_config.hidden_size,
             config.text_config.rms_norm_eps as f32,
         )
         .map_err(AsrError::model_load)?;
+        let ms_ad = t.elapsed().as_secs_f64() * 1000.0;
+
+        let t = std::time::Instant::now();
         let decoder = CpuTextDecoder::load(
-            &weight_data,
+            weight_data,
             "model.language_model",
             &config.text_config,
         )
         .map_err(AsrError::model_load)?;
+        let ms_dec = t.elapsed().as_secs_f64() * 1000.0;
 
-        let tokens = build_special_tokens(&tokenizer, &config);
-
-        // GPU stack (optional): shared CudaState drives encoder + adaptor + decoder.
-        // Device open: Auto and Cuda both fall back to CPU on init failure.
-        // Component loads are sequential with early exit (no wasted VRAM on later stages).
-        #[cfg(feature = "cuda")]
-        let gpu = {
-            match backend {
-                Backend::Cpu => None,
-                Backend::Cuda | Backend::Auto => match backend.resolve() {
-                    crate::backend::ResolvedBackend::Cpu => None,
-                    crate::backend::ResolvedBackend::Cuda(cuda) => {
-                        // Keep CPU encoder/adaptor/decoder unshadowed for finish_cpu fallback.
-                        let gpu_enc = match crate::gpu_whisper::GpuWhisperEncoder::load(
-                            cuda.clone(),
-                            &weight_data,
-                            "model.whisper_encoder",
-                            &config.audio_config,
-                        ) {
-                            Ok(e) => e,
-                            Err(e) => {
-                                log::warn!("GPU encoder load failed ({e}); using CPU");
-                                return Self::finish_cpu(
-                                    config, pc, tokenizer, mel, encoder, adaptor, decoder, tokens,
-                                );
-                            }
-                        };
-                        let gpu_dec = match crate::cudarc_engine::GpuTextDecoder::load_with(
-                            cuda.clone(),
-                            &weight_data,
-                            "model.language_model",
-                            &config.text_config,
-                        ) {
-                            Ok(d) => d,
-                            Err(e) => {
-                                log::warn!("GPU decoder load failed ({e}); using CPU");
-                                return Self::finish_cpu(
-                                    config, pc, tokenizer, mel, encoder, adaptor, decoder, tokens,
-                                );
-                            }
-                        };
-                        let gpu_ad = match crate::cudarc_engine::GpuVqAdaptor::load(
-                            cuda.clone(),
-                            &weight_data,
-                            "model.vq_adaptor",
-                            config.text_config.hidden_size,
-                            config.text_config.rms_norm_eps as f32,
-                        ) {
-                            Ok(a) => a,
-                            Err(e) => {
-                                log::warn!("GPU adaptor load failed ({e}); using CPU");
-                                return Self::finish_cpu(
-                                    config, pc, tokenizer, mel, encoder, adaptor, decoder, tokens,
-                                );
-                            }
-                        };
-                        log::info!(
-                            "GPU stack loaded: Whisper encoder + VQAdaptor + Qwen3 decoder (cuda backend)"
-                        );
-                        Some(GpuStack {
-                            cuda,
-                            encoder: gpu_enc,
-                            adaptor: gpu_ad,
-                            decoder: gpu_dec,
-                        })
-                    }
-                },
-            }
-        };
-
-        // When cuda feature is off, resolve still selects CPU (no GPU path).
-        #[cfg(not(feature = "cuda"))]
-        let _ = backend.resolve();
-
-        let _ = weight_data; // already loaded into encoder/adaptor/decoder(/gpu)
-        Ok(Self {
-            inner: Mutex::new(AsrInner {
-                config,
-                pc,
-                tokenizer,
-                mel,
-                encoder,
-                adaptor,
-                decoder,
-                #[cfg(feature = "cuda")]
-                gpu,
-                tokens,
-            }),
+        log::info!(
+            "CPU stack loaded: encoder={:.0}ms adaptor={:.0}ms decoder={:.0}ms",
+            ms_enc, ms_ad, ms_dec
+        );
+        Ok(ComputeStack::Cpu {
+            encoder,
+            adaptor,
+            decoder,
         })
     }
 
-    /// CPU-only stack used when GPU init or a GPU component load fails mid-way.
+    /// Load GPU encoder + decoder + adaptor + host embed table. On any failure, returns Err
+    /// so the caller can fall back to a full CPU stack (partial GPU state is dropped).
     #[cfg(feature = "cuda")]
-    fn finish_cpu(
-        config: MossConfig,
-        pc: ProcessorConfig,
-        tokenizer: tokenizers::Tokenizer,
-        mel: MelExtractor,
-        encoder: CpuWhisperEncoder,
-        adaptor: CpuVqAdaptor,
-        decoder: CpuTextDecoder,
-        tokens: SpecialTokens,
-    ) -> Result<Self> {
-        Ok(Self {
-            inner: Mutex::new(AsrInner {
-                config,
-                pc,
-                tokenizer,
-                mel,
-                encoder,
-                adaptor,
-                decoder,
-                gpu: None,
-                tokens,
-            }),
+    fn try_load_gpu_stack(
+        cuda: std::sync::Arc<crate::cudarc_engine::CudaState>,
+        weight_data: &std::collections::HashMap<String, crate::raw_tensor::RawTensor>,
+        config: &MossConfig,
+    ) -> AnyResult<ComputeStack> {
+        let t = std::time::Instant::now();
+        let gpu_enc = crate::gpu_whisper::GpuWhisperEncoder::load(
+            cuda.clone(),
+            weight_data,
+            "model.whisper_encoder",
+            &config.audio_config,
+        )?;
+        let ms_enc = t.elapsed().as_secs_f64() * 1000.0;
+
+        let t = std::time::Instant::now();
+        let gpu_dec = crate::cudarc_engine::GpuTextDecoder::load_with(
+            cuda.clone(),
+            weight_data,
+            "model.language_model",
+            &config.text_config,
+        )?;
+        let ms_dec = t.elapsed().as_secs_f64() * 1000.0;
+
+        let t = std::time::Instant::now();
+        let gpu_ad = crate::cudarc_engine::GpuVqAdaptor::load(
+            cuda.clone(),
+            weight_data,
+            "model.vq_adaptor",
+            config.text_config.hidden_size,
+            config.text_config.rms_norm_eps as f32,
+        )?;
+        let ms_ad = t.elapsed().as_secs_f64() * 1000.0;
+
+        // Same f16 embed conversion as CpuTextDecoder — prompt scatter stays bit-identical.
+        let t = std::time::Instant::now();
+        let embed_table = cpu_engine::load_embed_table_f16(weight_data, "model.language_model")?;
+        let ms_embed = t.elapsed().as_secs_f64() * 1000.0;
+
+        log::info!(
+            "GPU stack loaded: encoder={:.0}ms decoder={:.0}ms adaptor={:.0}ms host_embed={:.0}ms (no CPU encoder/layers)",
+            ms_enc, ms_dec, ms_ad, ms_embed
+        );
+        Ok(ComputeStack::Gpu {
+            stack: GpuStack {
+                cuda,
+                encoder: gpu_enc,
+                adaptor: gpu_ad,
+                decoder: gpu_dec,
+            },
+            embed_table,
         })
     }
 
@@ -385,19 +423,22 @@ impl AsrInner {
         // 2. Whisper encoder over each chunk → trim → concat per audio → cast → time_merge → adaptor
         let tt = std::time::Instant::now();
         #[cfg(feature = "cuda")]
-        if let Some(gpu) = self.gpu.as_ref() { gpu.encoder.synchronize().ok(); }
-        #[cfg(feature = "cuda")]
-        let audio_embeds = if self.gpu.is_some() {
-            self.encode_audio_gpu(&input_features, num_mel, &feature_lengths, &chunk_mapping)?
-        } else {
-            self.encode_audio(&input_features, n_chunks, num_mel, &feature_lengths, &chunk_mapping)?
+        if let ComputeStack::Gpu { stack, .. } = &self.compute {
+            stack.encoder.synchronize().ok();
+        }
+        let audio_embeds = match &self.compute {
+            #[cfg(feature = "cuda")]
+            ComputeStack::Gpu { stack, .. } => {
+                self.encode_audio_gpu(stack, &input_features, num_mel, &feature_lengths, &chunk_mapping)?
+            }
+            ComputeStack::Cpu { .. } => {
+                self.encode_audio(&input_features, n_chunks, num_mel, &feature_lengths, &chunk_mapping)?
+            }
         };
-        #[cfg(not(feature = "cuda"))]
-        let audio_embeds = self.encode_audio(
-            &input_features, n_chunks, num_mel, &feature_lengths, &chunk_mapping,
-        )?;
         #[cfg(feature = "cuda")]
-        if let Some(gpu) = self.gpu.as_ref() { gpu.encoder.synchronize().ok(); }
+        if let ComputeStack::Gpu { stack, .. } = &self.compute {
+            stack.encoder.synchronize().ok();
+        }
         let t_encode = tt.elapsed();
 
         // 3. Build prompt: chat template + audio span (with time markers)
@@ -421,7 +462,16 @@ impl AsrInner {
         // 4. Embed ALL input_ids, then masked_scatter audio embeds into every
         //    audio_token_id position (matching Python's inputs_embeds.masked_scatter).
         //    Digit time-marker positions keep their own token embeddings.
-        let all_emb = self.decoder.embed_ids(&input_ids);
+        //
+        // Host f16 embed path is shared: full CPU decoder, or the GPU-path embed-only table
+        // (same load_weight_f16 conversion — bit-identical to the previous dual-load path).
+        let all_emb = match &self.compute {
+            ComputeStack::Cpu { decoder, .. } => decoder.embed_ids(&input_ids),
+            #[cfg(feature = "cuda")]
+            ComputeStack::Gpu { embed_table, .. } => {
+                cpu_engine::embed_lookup_f16(embed_table, &input_ids)
+            }
+        };
         let mut hs_data = all_emb.data;
         let mut ai = 0usize;
         for pos in 0..seq_len {
@@ -449,22 +499,17 @@ impl AsrInner {
         let eos_ids: &[i64] = &[self.tokens.im_end];
         log::debug!("eos_ids im_end={} audio_pad={}", self.tokens.im_end, self.config.audio_token_id);
 
-        #[cfg(feature = "cuda")]
-        let (t_prefill, t_decode, generated, _current_pos) = if let Some(gpu) = self.gpu.as_ref() {
-            self.generate_gpu(
-                gpu, &hidden_states, &all_pos, seq_len, max_new_tokens, eos_ids, on_delta,
-            )?
-        } else {
-            self.generate_cpu(
+        let (t_prefill, t_decode, generated, _current_pos) = match &self.compute {
+            #[cfg(feature = "cuda")]
+            ComputeStack::Gpu { stack, .. } => self.generate_gpu(
+                stack, &hidden_states, &all_pos, seq_len, max_new_tokens, eos_ids, on_delta,
+            )?,
+            ComputeStack::Cpu { decoder, .. } => self.generate_cpu(
+                decoder,
                 &hidden_states, &cos_table, &sin_table, total_positions, seq_len, max_new_tokens,
                 eos_ids, on_delta,
-            )?
+            )?,
         };
-        #[cfg(not(feature = "cuda"))]
-        let (t_prefill, t_decode, generated, _current_pos) = self.generate_cpu(
-            &hidden_states, &cos_table, &sin_table, total_positions, seq_len, max_new_tokens,
-            eos_ids, on_delta,
-        )?;
         log::debug!("generated last 8 ids: {:?}", generated.iter().rev().take(8).copied().collect::<Vec<_>>());
 
         // 7. Final decode (same options as stream path). Stream deltas already used this.
@@ -485,15 +530,17 @@ impl AsrInner {
     }
 
     fn backend_tag(&self) -> &'static str {
-        #[cfg(feature = "cuda")]
-        { if self.gpu.is_some() { "cuda" } else { "cpu" } }
-        #[cfg(not(feature = "cuda"))]
-        { "cpu" }
+        match &self.compute {
+            ComputeStack::Cpu { .. } => "cpu",
+            #[cfg(feature = "cuda")]
+            ComputeStack::Gpu { .. } => "cuda",
+        }
     }
 
     /// CPU prefill + decode loop. Returns (prefill_dur, decode_dur, generated_ids, final_pos).
     fn generate_cpu(
         &self,
+        decoder: &CpuTextDecoder,
         hidden_states: &CpuTensor,
         cos_table: &[f32], sin_table: &[f32],
         total_positions: usize, seq_len: usize, max_new_tokens: usize,
@@ -506,7 +553,7 @@ impl AsrInner {
             self.config.text_config.head_dim,
         );
         let tt = std::time::Instant::now();
-        let logits = self.decoder.forward(
+        let logits = decoder.forward(
             CpuTensor::new(hidden_states.data.clone(), hidden_states.shape.clone()),
             cos_table, sin_table, &mut kv, 0, true, true,
         );
@@ -523,9 +570,9 @@ impl AsrInner {
             if let Some(cb) = on_delta.as_deref_mut() {
                 push_stream_delta(&self.tokenizer, &generated, &mut prev_text, cb)?;
             }
-            let ne = self.decoder.embed_ids(&[next_token]);
+            let ne = decoder.embed_ids(&[next_token]);
             let ne = CpuTensor::new(ne.data, vec![1, 1, hidden]);
-            let sl = self.decoder.forward(ne, cos_table, sin_table, &mut kv, current_pos, true, true);
+            let sl = decoder.forward(ne, cos_table, sin_table, &mut kv, current_pos, true, true);
             next_token = cpu_engine::argmax(&sl.data) as i64;
             current_pos += 1;
         }
@@ -609,6 +656,7 @@ impl AsrInner {
     #[cfg(feature = "cuda")]
     fn encode_audio_gpu(
         &self,
+        gpu: &GpuStack,
         input_features: &[f32],
         num_mel: usize,
         feature_lengths: &[usize],
@@ -616,7 +664,6 @@ impl AsrInner {
     ) -> AnyResult<Vec<f32>> {
         use crate::cudarc_engine::GpuTensor;
         use half::bf16;
-        let gpu = self.gpu.as_ref().unwrap();
         let cuda = &gpu.cuda;
         let nb_frames = self.pc.nb_max_frames;
         let d_model = self.config.audio_config.d_model;
@@ -670,7 +717,7 @@ impl AsrInner {
     }
 
     /// Encode audio: Whisper encoder per chunk → trim → concat → time_merge → VQAdaptor.
-    /// Returns [nat, hidden] f32 (hidden = text hidden_size).
+    /// Returns [nat, hidden] f32 (hidden = text hidden_size). CPU stack only.
     fn encode_audio(
         &self,
         input_features: &[f32],
@@ -679,6 +726,13 @@ impl AsrInner {
         feature_lengths: &[usize],
         chunk_mapping: &[usize],
     ) -> AnyResult<Vec<f32>> {
+        let (encoder, adaptor) = match &self.compute {
+            ComputeStack::Cpu { encoder, adaptor, .. } => (encoder, adaptor),
+            #[cfg(feature = "cuda")]
+            ComputeStack::Gpu { .. } => {
+                return Err(anyhow!("encode_audio called with GPU stack; use encode_audio_gpu"));
+            }
+        };
         let nb_frames = self.pc.nb_max_frames;
         let d_model = self.config.audio_config.d_model;
         let merge = self.pc.audio_merge_size;
@@ -699,32 +753,18 @@ impl AsrInner {
             let mut cat_t = 0usize;
             for &(ci, tl) in parts {
                 let chunk_mel = &input_features[ci * num_mel * nb_frames..(ci + 1) * num_mel * nb_frames];
-                // GPU path returns host f32 [1, T_out, d_model]; CPU path returns CpuEncTensor.
-                #[cfg(feature = "cuda")]
-                let (enc_data, t_out): (Vec<f32>, usize) = if let Some(gpu) = self.gpu.as_ref() {
-                    let out = gpu.encoder.forward_f32(chunk_mel, num_mel, nb_frames)?;
-                    let t = out.len() / d_model;
-                    (out, t)
-                } else {
-                    let mel_t = CpuEncTensor::new(chunk_mel.to_vec(), vec![1, num_mel, nb_frames]);
-                    let enc = self.encoder.forward(&mel_t); // [1, T_out, d_model]
-                    (enc.data, enc.shape[1])
-                };
-                #[cfg(not(feature = "cuda"))]
-                let (enc_data, t_out): (Vec<f32>, usize) = {
-                    let mel_t = CpuEncTensor::new(chunk_mel.to_vec(), vec![1, num_mel, nb_frames]);
-                    let enc = self.encoder.forward(&mel_t);
-                    (enc.data, enc.shape[1])
-                };
+                let mel_t = CpuEncTensor::new(chunk_mel.to_vec(), vec![1, num_mel, nb_frames]);
+                let enc = encoder.forward(&mel_t); // [1, T_out, d_model]
+                let t_out = enc.shape[1];
                 let keep = (tl * 4).min(t_out);
-                cat.extend_from_slice(&enc_data[..keep * d_model]);
+                cat.extend_from_slice(&enc.data[..keep * d_model]);
                 cat_t += keep;
             }
             // cast to model dtype (f32 here; Python casts bf16/fp16 then merges)
             // time_merge (B=1, T=cat_t, D=d_model) → (1, cat_t/merge, d_model*merge)
             let (merged, out_t, out_d) = time_merge(&cat, 1, cat_t, d_model, merge);
             // adaptor: [1, out_t, out_d] → [1, out_t, hidden]
-            let adapted = self.adaptor.forward(&merged, 1, out_t, out_d);
+            let adapted = adaptor.forward(&merged, 1, out_t, out_d);
             adapted_all.extend_from_slice(&adapted[..out_t * dtype_hidden]);
         }
         Ok(adapted_all)

@@ -85,27 +85,39 @@ impl CpuWeightI8 {
     /// scale = max(|row|)/127; values clipped to [-127,127] (using /127, not /128, so two
     /// quantised values multiply to ≤16129 — stays in i16 without saturation).  `cols` is
     /// padded to a multiple of 32 with zeros.
+    ///
+    /// Rows are independent → rayon over rows (bit-identical to the sequential loop).
     pub(crate) fn from_f16(w: &CpuWeightF16) -> Self {
         let rows = w.rows;
         let k = w.cols;
         let kpad = (k + 31) / 32 * 32;
         let mut data = vec![0i8; rows * kpad];
         let mut scale = vec![0.0f32; rows];
-        for i in 0..rows {
-            let src = &w.data[i * k..(i + 1) * k];
-            // Pass 1: per-row max abs.
-            let mut amax = 0.0f32;
-            for v in src { let a = v.to_f32().abs(); if a > amax { amax = a; } }
-            let s = amax / 127.0;
-            scale[i] = s;
-            let inv = if s > 0.0 { 1.0 / s } else { 0.0 };
-            // Pass 2: quantise + clip into the padded row (tail [k..kpad] stays zero).
-            let dst = &mut data[i * kpad..(i + 1) * kpad];
-            for j in 0..k {
-                dst[j] = (src[j].to_f32() * inv).round().clamp(-127.0, 127.0) as i8;
-            }
+        data.par_chunks_mut(kpad)
+            .zip(scale.par_iter_mut())
+            .zip(w.data.par_chunks(k))
+            .for_each(|((dst, s_out), src)| {
+                let mut amax = 0.0f32;
+                for v in src {
+                    let a = v.to_f32().abs();
+                    if a > amax {
+                        amax = a;
+                    }
+                }
+                let s = amax / 127.0;
+                *s_out = s;
+                let inv = if s > 0.0 { 1.0 / s } else { 0.0 };
+                for j in 0..k {
+                    dst[j] = (src[j].to_f32() * inv).round().clamp(-127.0, 127.0) as i8;
+                }
+                // tail [k..kpad] stays zero from the initial allocation
+            });
+        CpuWeightI8 {
+            data,
+            scale,
+            rows,
+            cols: kpad,
         }
-        CpuWeightI8 { data, scale, rows, cols: kpad }
     }
 
     /// Dequantise to a real-k f32 weight for the prefill GEMM path (drops the 32-padding so
@@ -859,12 +871,14 @@ pub(crate) struct CpuTextDecoder {
 
 impl CpuTextDecoder {
     pub fn load(weights: &HashMap<String, RawTensor>, prefix: &str, config: &TextDecoderConfig) -> Result<Self> {
-        let embed_table = load_weight_f16(weights, &format!("{}.embed_tokens.weight", prefix))?;
+        let embed_table = load_embed_table_f16(weights, prefix)?;
         let norm_w = load_vec_f32(weights, &format!("{}.norm.weight", prefix))?;
-        let mut layers = Vec::with_capacity(config.num_hidden_layers);
-        for i in 0..config.num_hidden_layers {
-            layers.push(CpuDecoderLayer::load(weights, &format!("{}.layers.{}", prefix, i), config)?);
-        }
+        // Layers are independent; parallel load keeps sequential bit-identical results.
+        let layers: Result<Vec<_>> = (0..config.num_hidden_layers)
+            .into_par_iter()
+            .map(|i| CpuDecoderLayer::load(weights, &format!("{}.layers.{}", prefix, i), config))
+            .collect();
+        let layers = layers?;
         Ok(Self { embed_table, layers, norm_w, eps: config.rms_norm_eps as f32, config: config.clone() })
     }
 
@@ -961,6 +975,16 @@ fn load_weight_f16(weights: &HashMap<String, RawTensor>, name: &str) -> Result<C
     let (data, shape) = load_f16_vec(weights, name)?;
     assert_eq!(shape.len(), 2, "weight {} should be 2D", name);
     Ok(CpuWeightF16 { data, rows: shape[0], cols: shape[1] })
+}
+
+/// Load only `embed_tokens.weight` as f16 (same conversion as full decoder load).
+/// Used by the CUDA path so prompt scatter stays bit-identical without loading
+/// the full CPU decoder (layers + INT8 quant).
+pub(crate) fn load_embed_table_f16(
+    weights: &HashMap<String, RawTensor>,
+    prefix: &str,
+) -> Result<CpuWeightF16> {
+    load_weight_f16(weights, &format!("{}.embed_tokens.weight", prefix))
 }
 
 /// Load Q+K+V projections and concatenate into a single [q_dim + 2*kv_dim, hidden] f16 matrix.

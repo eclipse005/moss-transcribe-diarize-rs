@@ -316,14 +316,17 @@ pub(crate) struct CpuWhisperEncoder {
 
 impl CpuWhisperEncoder {
     pub(crate) fn load(weights: &HashMap<String, RawTensor>, prefix: &str, cfg: &WhisperAudioConfig) -> Result<Self> {
+        use rayon::prelude::*;
         let g = |name: &str| -> Result<Vec<f32>> {
             Ok(weights.get(name).ok_or_else(|| anyhow::anyhow!("missing {}", name))?.to_f32_vec()?)
         };
         let p = |s: &str| format!("{}.{}", prefix, s);
-        let mut layers = Vec::with_capacity(cfg.encoder_layers);
-        for i in 0..cfg.encoder_layers {
-            layers.push(CpuWhisperLayer::load(weights, &format!("{}.layers.{}", prefix, i), cfg)?);
-        }
+        // Layers are independent; parallel load is bit-identical to sequential.
+        let layers: Result<Vec<_>> = (0..cfg.encoder_layers)
+            .into_par_iter()
+            .map(|i| CpuWhisperLayer::load(weights, &format!("{}.layers.{}", prefix, i), cfg))
+            .collect();
+        let layers = layers?;
         Ok(Self {
             conv1_w: g(&p("conv1.weight"))?,
             conv1_b: g(&p("conv1.bias"))?,

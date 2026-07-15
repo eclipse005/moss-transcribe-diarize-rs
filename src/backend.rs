@@ -19,10 +19,11 @@ use crate::error::{AsrError, Result};
 /// `Auto` detects the best available backend at load time (prefers CUDA when
 /// the `cuda` feature is enabled and a device is present; falls back to CPU).
 ///
-/// **CUDA init failure contract (historical):** both `Auto` and explicit `Cuda`
-/// fall back to CPU with a warning if the device cannot be opened. Component
-/// loads (encoder / decoder / adaptor) that fail after a successful device open
-/// also fall back to CPU — see `AsrInference::load_with`.
+/// **CUDA init / load failure contract (historical):** both `Auto` and explicit
+/// `Cuda` fall back to CPU with a warning if the device cannot be opened, or if
+/// a GPU component load fails. Only one full weight stack is materialised
+/// (CUDA success does not also load the CPU encoder/decoder) — see
+/// `AsrInference::load_with`.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Backend {
