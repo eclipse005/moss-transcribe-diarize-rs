@@ -21,6 +21,8 @@ pub(crate) mod weights;
 pub(crate) mod cudarc_engine;
 #[cfg(feature = "cuda")]
 pub(crate) mod gpu_whisper;
+#[cfg(feature = "cuda")]
+pub(crate) mod prebuilt_ptx;
 
 // Public surface.
 pub mod backend;
