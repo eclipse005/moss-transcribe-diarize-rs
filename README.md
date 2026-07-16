@@ -130,11 +130,25 @@ println!("{text}");
 
 ## 模型下载
 
-从 HuggingFace 下载：
+权重版权归原作者，请从官方渠道获取：
 
-- [OpenMOSS/moss-transcribe-diarize](https://huggingface.co/OpenMOSS/moss-transcribe-diarize)
+- Hugging Face：[OpenMOSS-Team/MOSS-Transcribe-Diarize](https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize)
+- ModelScope：[openmoss/MOSS-Transcribe-Diarize](https://modelscope.cn/models/openmoss/MOSS-Transcribe-Diarize)
+- 官方代码与文档：[OpenMOSS/MOSS-Transcribe-Diarize](https://github.com/OpenMOSS/MOSS-Transcribe-Diarize)
 
 模型目录需包含 `config.json`、`model*.safetensors`、`tokenizer.json`、`chat_template.jinja` 等文件。
+
+## 致谢 / 原版出处
+
+本仓库是 **独立的 Rust + 手写 CUDA 推理实现**，用于加载并运行 OpenMOSS 发布的 MOSS-Transcribe-Diarize 权重；**不是** OpenMOSS 官方发行版，与原作者无隶属关系。
+
+| 组件 | 原版 | 链接 | 协议（以官方页面为准） |
+|------|------|------|------------------------|
+| 模型权重 | MOSS-Transcribe-Diarize | [HF](https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize) · [ModelScope](https://modelscope.cn/models/openmoss/MOSS-Transcribe-Diarize) | 见模型卡（官方代码仓库标为 Apache-2.0） |
+| 官方 Python 推理 | MOSS-Transcribe-Diarize | [OpenMOSS/MOSS-Transcribe-Diarize](https://github.com/OpenMOSS/MOSS-Transcribe-Diarize) | Apache-2.0 |
+| 架构参考（组件） | Whisper 编码器配置 + Qwen3 风格解码器 | OpenAI Whisper · Alibaba Qwen3 | 见各自上游 |
+
+使用模型权重时请遵守原作者许可证；本仓库的 Rust 推理代码以本仓库 License 为准。
 
 ## License
 
